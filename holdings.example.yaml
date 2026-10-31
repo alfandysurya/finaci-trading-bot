@@ -1,0 +1,6 @@
+# Optional. Copy to holdings.yaml and keep it roughly in sync with Pluang
+# (or skip it — the execution prompt has Claude reconcile against your live account).
+cash_usd: 650.00
+positions:          # shares (fractional is fine)
+  AAPL: 0.75
+  MSFT: 0.30

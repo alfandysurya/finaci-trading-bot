@@ -1,0 +1,23 @@
+[project]
+name = "finaci-trading-bot"
+version = "0.1.0"
+description = "Semi-automated US stock proposals with paper validation"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "pyarrow>=14.0",
+    "pyyaml>=6.0",
+    "scipy>=1.10",
+    "yfinance>=0.2.40",
+]
+
+[dependency-groups]
+dev = ["pytest>=7.0"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

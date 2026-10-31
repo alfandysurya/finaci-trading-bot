@@ -1,0 +1,157 @@
+{
+  "schema": "pluang-proposals/v1",
+  "generated_at": "2026-10-31T16:30:07+00:00",
+  "valid_until": "2026-11-04T16:30:07+00:00",
+  "data_as_of": "2026-10-30",
+  "strategy": "sma_cross(fast=50,slow=200)",
+  "equity_usd": 1000,
+  "limits": {
+    "max_positions": 8,
+    "max_weight": 0.15,
+    "max_total_buy_usd": 950.0
+  },
+  "orders": [
+    {
+      "ticker": "AAPL",
+      "side": "BUY",
+      "usd_amount": 150.0,
+      "sell_all": false,
+      "order_type": "LIMIT",
+      "limit_price": 346.35,
+      "ref_price": 344.63,
+      "max_price_deviation": 0.03,
+      "reason": "sma_cross(fast=50,slow=200) signal=LONG; close 344.63, SMA50 333.04, SMA200 296.27, RSI14 55.4, 6m +23.2%"
+    },
+    {
+      "ticker": "MSFT",
+      "side": "BUY",
+      "usd_amount": 150.0,
+      "sell_all": false,
+      "order_type": "LIMIT",
+      "limit_price": 524.52,
+      "ref_price": 521.91,
+      "max_price_deviation": 0.03,
+      "reason": "sma_cross(fast=50,slow=200) signal=LONG; close 521.91, SMA50 512.91, SMA200 436.85, RSI14 49.0, 6m +26.4%"
+    },
+    {
+      "ticker": "V",
+      "side": "BUY",
+      "usd_amount": 150.0,
+      "sell_all": false,
+      "order_type": "LIMIT",
+      "limit_price": 415.66,
+      "ref_price": 413.59,
+      "max_price_deviation": 0.03,
+      "reason": "sma_cross(fast=50,slow=200) signal=LONG; close 413.59, SMA50 381.31, SMA200 341.45, RSI14 69.4, 6m +26.6%"
+    },
+    {
+      "ticker": "XOM",
+      "side": "BUY",
+      "usd_amount": 141.73,
+      "sell_all": false,
+      "order_type": "LIMIT",
+      "limit_price": 188.19,
+      "ref_price": 187.25,
+      "max_price_deviation": 0.03,
+      "reason": "sma_cross(fast=50,slow=200) signal=LONG; close 187.25, SMA50 167.76, SMA200 153.39, RSI14 73.0, 6m +24.2%"
+    },
+    {
+      "ticker": "MA",
+      "side": "BUY",
+      "usd_amount": 138.75,
+      "sell_all": false,
+      "order_type": "LIMIT",
+      "limit_price": 641.2,
+      "ref_price": 638.01,
+      "max_price_deviation": 0.03,
+      "reason": "sma_cross(fast=50,slow=200) signal=LONG; close 638.01, SMA50 586.14, SMA200 534.24, RSI14 70.7, 6m +29.2%"
+    },
+    {
+      "ticker": "CRM",
+      "side": "BUY",
+      "usd_amount": 89.22,
+      "sell_all": false,
+      "order_type": "LIMIT",
+      "limit_price": 230.32,
+      "ref_price": 229.17,
+      "max_price_deviation": 0.03,
+      "reason": "sma_cross(fast=50,slow=200) signal=LONG; close 229.17, SMA50 238.75, SMA200 197.64, RSI14 42.4, 6m +25.2%"
+    },
+    {
+      "ticker": "LLY",
+      "side": "BUY",
+      "usd_amount": 84.53,
+      "sell_all": false,
+      "order_type": "LIMIT",
+      "limit_price": 1424.63,
+      "ref_price": 1417.54,
+      "max_price_deviation": 0.03,
+      "reason": "sma_cross(fast=50,slow=200) signal=LONG; close 1417.54, SMA50 1197.14, SMA200 1089.28, RSI14 77.9, 6m +47.6%"
+    },
+    {
+      "ticker": "AMD",
+      "side": "BUY",
+      "usd_amount": 45.77,
+      "sell_all": false,
+      "order_type": "LIMIT",
+      "limit_price": 507.32,
+      "ref_price": 504.8,
+      "max_price_deviation": 0.03,
+      "reason": "sma_cross(fast=50,slow=200) signal=LONG; close 504.8, SMA50 548.29, SMA200 410.49, RSI14 39.7, 6m +40.0%"
+    }
+  ],
+  "targets": [
+    {
+      "ticker": "AAPL",
+      "target_weight": 0.15,
+      "target_usd": 150.0,
+      "current_usd": 0.0
+    },
+    {
+      "ticker": "AMD",
+      "target_weight": 0.0458,
+      "target_usd": 45.77,
+      "current_usd": 0.0
+    },
+    {
+      "ticker": "CRM",
+      "target_weight": 0.0892,
+      "target_usd": 89.22,
+      "current_usd": 0.0
+    },
+    {
+      "ticker": "LLY",
+      "target_weight": 0.0845,
+      "target_usd": 84.53,
+      "current_usd": 0.0
+    },
+    {
+      "ticker": "MA",
+      "target_weight": 0.1388,
+      "target_usd": 138.75,
+      "current_usd": 0.0
+    },
+    {
+      "ticker": "MSFT",
+      "target_weight": 0.15,
+      "target_usd": 150.0,
+      "current_usd": 0.0
+    },
+    {
+      "ticker": "V",
+      "target_weight": 0.15,
+      "target_usd": 150.0,
+      "current_usd": 0.0
+    },
+    {
+      "ticker": "XOM",
+      "target_weight": 0.1417,
+      "target_usd": 141.73,
+      "current_usd": 0.0
+    }
+  ],
+  "notes": [
+    "PAPER ONLY: this strategy has not passed `validate`. Do not place real orders.",
+    "No holdings file given: amounts assume an empty account. Claude must reconcile against the live Pluang portfolio before proposing anything."
+  ]
+}

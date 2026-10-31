@@ -1,0 +1,72 @@
+# ---------------------------------------------------------------
+# Pluang semi-auto trader — configuration
+# Every value here is meant to be edited. Nothing places orders on
+# its own: the pipeline writes proposals, Claude + the Pluang
+# connector submits them, and YOU confirm each one in Pluang.
+# ---------------------------------------------------------------
+
+universe:
+  # Keep this to tickers you have verified are tradable on Pluang
+  # (Pluang lists 650+ US stocks/ETFs). Liquid large caps to start.
+  tickers: [AAPL, MSFT, NVDA, AMZN, GOOGL, META, TSLA, AVGO, JPM, V,
+            MA, UNH, XOM, LLY, JNJ, PG, HD, COST, NFLX, AMD,
+            CRM, ORCL, KO, PEP, WMT, BAC, ADBE, QCOM, INTC, DIS]
+  benchmark: SPY
+  # Validation only, never traded. Approximate largest US caps at end-2009 (from memory),
+  # used to reduce the hindsight in the list above.
+  bias_check_tickers: [XOM, MSFT, WMT, AAPL, PG, JNJ, IBM, JPM, GE, CVX,
+                       T, BAC, WFC, KO, GOOGL, PFE, PM, ORCL, PEP, MRK,
+                       INTC, CSCO, HPQ, C, VZ, ABT, MCD, SLB, QCOM, AMZN]
+
+# One fixed rule, checked at the last close of each month. Walk-forward selection did not beat
+# this rule. Do not change it to pass validation: that is overfitting.
+strategy:
+  name: sma_cross
+  params: {fast: 50, slow: 200}
+
+validation:
+  start: "2015-01-01"
+
+data:
+  source: yfinance          # yfinance | csv
+  csv_dir: data/csv         # used when source = csv (one <TICKER>.csv per ticker)
+  cache_dir: data/cache
+  start: "2010-01-01"
+
+costs:
+  # Pluang US stocks fee schedule (checked 2026-10-31, pluang.com/en/biaya/us-stocks):
+  #   transaction fee 0.30% (0.20% for Pluang Plus) + 11% VAT
+  #   JFX & KBI fee 0.05%, max $0.10 per transaction (+ VAT) -> cap only binds above $200
+  #   US regulatory fees on sells: about $0.03 minimum, so avoid very small sells
+  # Effective per-side cost incl. slippage ~0.44% regular / ~0.33% Plus.
+  fee_rate: 0.0030
+  jfx_rate: 0.0005
+  vat: 0.11
+  slippage_bps: 5           # extra per side: spread + delay between signal and your confirmation
+
+backtest:
+  execution: next_open      # signal on close of day t, filled at open of day t+1
+  risk_free_rate: 0.0
+
+walkforward:
+  train_years: 3
+  test_years: 1
+  # Score used to rank configs on the training window, pooled across the universe
+  score: median_sharpe      # median_sharpe | mean_sharpe | median_calmar
+  min_trades_per_year: 1    # configs that barely trade are ignored
+  max_trades_per_year: 24   # with ~0.7% round-trip cost, churn kills returns
+
+portfolio:
+  equity_usd: 1000          # what you plan to allocate on Pluang
+  max_positions: 8
+  max_weight: 0.15          # per position
+  cash_buffer: 0.05         # keep this fraction uninvested
+  sizing: inverse_vol       # equal | inverse_vol
+  vol_lookback: 20
+  min_order_usd: 30         # skip dust trades (minimum sell fees bite on small orders)
+  rebalance_threshold: 0.03 # ignore weight drifts smaller than this
+
+execution:
+  limit_buffer: 0.005       # buy limit = last close * (1 + buffer); sell = * (1 - buffer)
+  max_price_deviation: 0.03 # Claude skips an order if live price moved more than this
+  proposal_valid_hours: 96  # covers a weekend plus a Monday US holiday; Claude refuses older files

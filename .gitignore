@@ -1,0 +1,6 @@
+data/cache/
+holdings.yaml
+.env
+.venv/
+__pycache__/
+.pytest_cache/
