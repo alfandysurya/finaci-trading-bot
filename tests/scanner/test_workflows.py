@@ -97,3 +97,27 @@ def test_readme_mentions_all_secret_names_and_folder_id():
     assert FOLDER_ID in text
     assert not re.search(r"\d{6,}:[A-Za-z0-9_-]{35}", text)
     assert "-----BEGIN" not in text
+
+
+def test_daily_has_market_hours_guard_before_scan():
+    st = steps(load("daily"))
+    ids = [s.get("id") for s in st]
+    assert "market-guard" in ids
+    guard = st[ids.index("market-guard")]
+    scan = next(s for s in st if "python -m scanner daily" in s.get("run", ""))
+    assert st.index(guard) < st.index(scan)
+    run = guard["run"]
+    assert "America/New_York" in run and "930" in run and "1615" in run
+    assert "Refusing to run: US market is open; run after 16:00 America/New_York" in run
+    assert "exit 1" in run
+    assert "if" not in scan or "always" not in str(scan["if"])
+
+
+def test_readme_reset_names_state_json_and_command_timing():
+    text = README.read_text(encoding="utf-8")
+    reset = text.split("## Reset")[1].split("\n## ")[0]
+    assert "scanner_state/ledger.csv" in reset and "scanner_state/state.json" in reset
+    assert "peak" in reset
+    for keep in ("settings.json", "telegram_offset.json", "manifest.csv"):
+        assert keep in reset
+    assert "next run" in text and "weekend" in text

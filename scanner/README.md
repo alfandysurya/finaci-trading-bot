@@ -76,7 +76,7 @@ In GitHub, open the Actions tab, choose "scanner-weekly", and press "Run workflo
 
 ## Commands
 
-Send these to the bot in Telegram. They are processed at the next run, which can be up to a day later.
+Send these to the bot in Telegram. They take effect from the next run: the next daily or weekly job reads them first, before anything else. That is usually within about a day (the Sunday weekly, then the Monday evening daily). After Friday evening it can take up to about 2 days, over the weekend, until the Sunday weekly.
 
 - `/profile balanced`, `/profile value` or `/profile momentum`: switch the scoring profile.
 - `/toggle <indicator>`: turn one indicator on or off.
@@ -94,10 +94,14 @@ The job keeps its record in `scanner_state/` and commits it back to the reposito
 
 ## Reset
 
-To start the record over, delete `scanner_state/ledger.csv` and commit. Only do this if you really want to throw away the history.
+To start the paper record over, delete both `scanner_state/ledger.csv` and `scanner_state/state.json` (peak equity and the weekly-run marker), then commit. Only do this if you really want to throw away the history.
+
+Deleting only the ledger leaves a stale peak equity behind, which can pause buys.
+
+Keep the other files: `settings.json` (your profile and indicator choices), `telegram_offset.json` (so old commands are not replayed) and `manifest.csv` (the archive history).
 
 ## Known limits
 
 - GitHub scheduled runs can be delayed by several minutes.
 - On US exchange holidays the weekday run still happens but finds no new price bar, so nothing changes.
-- The daily run is timed after the US close on purpose, so it never acts on a half-finished day.
+- The daily run is timed after the US close on purpose, so it never acts on a half-finished day. If you start it by hand while the US market is open (Monday to Friday, 09:30 to 16:15 New York time), it stops with an error instead of running.
