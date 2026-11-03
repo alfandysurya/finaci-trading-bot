@@ -97,7 +97,7 @@ The job keeps its record in `scanner_state/` and commits it back to the reposito
 
 ## Reset
 
-To start the paper record over, delete both `scanner_state/ledger.csv` and `scanner_state/state.json` (peak equity and the weekly-run marker), then commit. Only do this if you really want to throw away the history.
+To start the paper record over, delete both `scanner_state/ledger.csv` and `scanner_state/state.json` (peak equity, the weekly-run marker and any messages still waiting to be re-sent, which are then dropped), then commit. Only do this if you really want to throw away the history.
 
 Deleting only the ledger leaves a stale peak equity behind, which can pause buys.
 

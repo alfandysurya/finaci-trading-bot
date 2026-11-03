@@ -577,9 +577,13 @@ def _weekly(run: _Run, cfg: dict, as_of: pd.Timestamp, state_dir: Path,
         prices = _fetch_prices(run.deps, tickers, as_of)
         uni_prices = {t: prices[t] for t in constituents["ticker"] if t in prices}
         total = len(constituents)
-        if total == 0 or len(uni_prices) < MIN_PRICE_COVERAGE * total:
+        # "Usable" = a frame whose last bar would pass the stale gate; frames that stop
+        # days early would all be rejected as stale_data and look like "No picks".
+        fresh_from = as_of - pd.Timedelta(days=gates["stale_days"])
+        usable = sum(1 for df in uni_prices.values() if _day(df.index[-1]) >= fresh_from)
+        if total == 0 or usable < MIN_PRICE_COVERAGE * total:
             # A data outage, not a quiet week: alert as a scan failure (no marker set).
-            raise RuntimeError(f"price data covers {len(uni_prices)} of {total} constituents")
+            raise RuntimeError(f"price data covers {usable} of {total} constituents")
         eligible, rejects = liquidity_filter(uni_prices, uni["min_dollar_volume"],
                                              uni["min_price"], uni.get("window", 20))
         for t in constituents["ticker"]:

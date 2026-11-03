@@ -11,7 +11,8 @@ FILES = {"weekly": WF_DIR / "scanner-weekly.yml", "daily": WF_DIR / "scanner-dai
 README = ROOT / "scanner" / "README.md"
 SECRETS = ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "GOOGLE_SERVICE_ACCOUNT_JSON",
            "DRIVE_FOLDER_ID", "SHEET_ID"]
-FOLDER_ID = "1WMlMlhfo9qGcnoAWESNs3WIp6bhv6qXH"
+# Made-up id with the shape of a Drive folder id (33 chars, letters and digits).
+FAKE_DRIVE_ID = "1AbCdEfGhIjKlMnOpQrStUvWxYz012345"
 
 
 def load(name):
@@ -103,14 +104,15 @@ def test_readme_mentions_all_secret_names_and_folder_id():
         assert secret in text
     assert "<your folder id>" in text
     assert "drive.google.com/drive/folders/<your folder id>" in text
-    assert FOLDER_ID not in text
     assert not DRIVE_ID_LIKE.search(text), DRIVE_ID_LIKE.search(text)
     assert not re.search(r"\d{6,}:[A-Za-z0-9_-]{35}", text)
     assert "-----BEGIN" not in text
 
 
 def test_drive_id_pattern_catches_real_ids():
-    assert DRIVE_ID_LIKE.search(f"id is {FOLDER_ID}.")
+    assert len(FAKE_DRIVE_ID) == 33
+    assert DRIVE_ID_LIKE.search(f"id is {FAKE_DRIVE_ID}.")
+    assert DRIVE_ID_LIKE.search(f"https://drive.google.com/drive/folders/{FAKE_DRIVE_ID}")
     assert not DRIVE_ID_LIKE.search("GOOGLE_SERVICE_ACCOUNT_JSON and DRIVE_FOLDER_ID")
 
 

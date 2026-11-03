@@ -1090,3 +1090,15 @@ def test_scan_failure_skips_sheets_mirror(cfg, state_dir):
     assert sheets.calls == []
     assert any(m.startswith("ALERT: scan failed") for m in tg.sent)
     assert res["archive_ok"] is False
+
+
+def test_weekly_stale_frames_do_not_count_as_coverage(cfg, state_dir):
+    """F-3: frames that stop days before as_of are an outage, not 'No picks'."""
+    from scanner.pipeline import run_weekly
+
+    cut = AS_OF - pd.Timedelta(days=10)
+    data = {t: df[df.index <= cut] for t, df in _synthetic().items()}
+    tg = FakeTelegram()
+    res = run_weekly(cfg, make_deps(tg, prices=data), AS_OF, state_dir)
+    assert any("price data covers 0 of 12 constituents" in e for e in res["errors"])
+    assert weekly_messages(tg) == []
