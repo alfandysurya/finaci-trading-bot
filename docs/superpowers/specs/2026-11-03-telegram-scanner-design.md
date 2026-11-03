@@ -117,20 +117,13 @@ A separate user-notes tab is never written by the job.
 - Gate tests: trend, earnings blackout, liquidity, sector cap.
 - Offline end-to-end dry run on cached data with Telegram and Sheets stubbed.
 
-### Backtest (sanity check only)
+### No backtest in v1
 
-A **price-only** backtest of the technical side (liquidity filter, trend gate,
-momentum/RSI/MACD/volume ranking, ATR stop and 1% sizing) is in scope as a test of
-the machinery and as a rough risk profile (drawdown, win rate, turnover).
-
-Limits, stated up front:
-- Free data has no point-in-time fundamentals or analyst history, so the fundamental
-  and sentiment scores cannot be backtested honestly. They are excluded.
-- Current S&P 500 membership introduces survivorship bias; results are optimistic.
-- It must not be used to tune parameters to pass a gate, and its result is not
-  evidence for going live. Per the 2026-10-31 review, the existing SMA rule failed
-  its SPY gate; this scanner gets no exemption.
-- Any backtest result is reported next to SPY buy & hold over the same window.
+Decided 2026-11-03: no backtest. Free data cannot give point-in-time fundamentals or
+analyst history, and S&P 500 membership history (rebuildable from Wikipedia's change
+table) still lacks prices for many delisted names, so any backtest would be biased
+and could tempt parameter tuning. The forward paper record (section 6) is the only
+performance evidence. A price-only backtest may be revisited later as a separate spec.
 
 ## 9. Go-live criteria (proposed)
 
@@ -141,7 +134,7 @@ pause rule. Thresholds to be confirmed by the user before that review.
 
 ## 10. Out of scope (v1)
 
-Two-way Sheets sync; live order placement; news sentiment; instant button handling
+Backtesting (including historical S&P membership reconstruction); two-way Sheets sync; live order placement; news sentiment; instant button handling
 (needs an always-on host); small caps; backfilled history.
 
 ## 11. Open items for review
