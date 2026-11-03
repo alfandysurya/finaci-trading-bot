@@ -76,7 +76,7 @@ def test_add_picks_idempotent(tmp_path):
     assert row["status"] == "pending"
     assert row["stop"] == pytest.approx(95.0)
     assert row["quantity"] == pytest.approx(20.0)
-    assert row["took_it"] is False or row["took_it"] == False  # noqa: E712
+    assert not row["took_it"]
     snap = json.loads(row["score_snapshot"])
     assert snap["atr14"] == pytest.approx(2.5)
     assert snap["close"] == pytest.approx(100.0)
@@ -250,6 +250,7 @@ def test_time_exit_after_56_days():
     assert led.iloc[0]["pending_exit"] == "time_exit"
     assert events[0]["kind"] == "time_exit"
     assert events[0]["date"] == "2026-03-02"
+    assert events[0]["price"] == pytest.approx(120.5)  # 2026-03-02 is bar 41 -> close 120.5
 
     led, events = process_exits(led, prices, "2026-03-04")
     row = led.iloc[0]
@@ -377,3 +378,89 @@ def test_equity_includes_unrealised_pnl():
     led = add_picks(led, picks({"BBB": (100.0, 10.0)}), "2026-01-02", "v1", 10_000.0)
     led = fill_pending(led, prices, "2026-01-05")
     assert equity(led, 10_000.0, prices) == pytest.approx(10_000.0 - 100.0 + 5 * 10.0)
+
+
+def test_stop_wins_over_same_bar_sell_signal():
+    # 62 bars; last bar has Low 79 <= stop 80 and Close 97 < SMA50 (99.94).
+    dates = pd.bdate_range("2026-01-01", periods=62)
+    data = [(dt, 100.0, 100.0, 100.0, 100.0) for dt in dates[:61]]
+    data.append((dates[61], 99.0, 100.0, 79.0, 97.0))
+    prices = {"AAA": bars(data)}
+    d = [dt.strftime("%Y-%m-%d") for dt in dates]
+    led = open_position(prices, atr=10.0, pick_date=d[59], fill_on=d[60])
+    led, events = process_exits(led, prices, d[61])
+    row = led.iloc[0]
+    assert row["status"] == "closed"
+    assert row["exit_reason"] == "stop"
+    assert row["exit_price"] == pytest.approx(80.0)  # min(stop 80, Open 99)
+    assert row["pending_exit"] == ""
+    assert row["pnl"] == pytest.approx((80.0 - 100.0) * 5.0)
+    assert [e["kind"] for e in events] == ["stop"]
+
+
+def scaled(prices: dict, factor: float) -> dict:
+    out = {}
+    for t, df in prices.items():
+        df = df.copy()
+        df[["Open", "High", "Low", "Close"]] = df[["Open", "High", "Low", "Close"]] * factor
+        out[t] = df
+    return out
+
+
+def test_split_adjusted_prices_skip_row_and_report_mismatch():
+    nominal = stop_prices(day2_open=97.0, day2_low=96.0)  # no stop in nominal terms
+    led = open_position(nominal)  # entry 100 on 2026-01-05, stop 95
+    split = scaled(nominal, 0.5)  # 2:1 split: every past bar halved
+    out, events = process_exits(led, split, "2026-01-06")
+    pd.testing.assert_frame_equal(out, led)
+    assert events == [{"ticker": "AAA", "pick_date": "2026-01-02", "kind": "data_mismatch",
+                       "price": pytest.approx(100.0), "date": "2026-01-05",
+                       "detail": pytest.approx(50.0)}]
+    # re-reported every call by design
+    _, again = process_exits(out, split, "2026-01-06")
+    assert [e["kind"] for e in again] == ["data_mismatch"]
+
+
+def test_small_dividend_drift_is_processed_normally():
+    nominal = stop_prices(day2_open=97.0, day2_low=94.0)
+    led = open_position(nominal)
+    drift = scaled(nominal, 0.99)  # entry bar Open 99.0 vs stored 100.0 -> 1%
+    out, events = process_exits(led, drift, "2026-01-06")
+    row = out.iloc[0]
+    assert row["status"] == "closed"
+    assert row["exit_reason"] == "stop"
+    assert row["exit_price"] == pytest.approx(95.0)  # min(stop 95, Open 96.03)
+    assert [e["kind"] for e in events] == ["stop"]
+
+
+def test_sunday_pick_fills_at_monday_open():
+    prices = {"AAA": bars([
+        ("2026-01-02", 99.0, 100.5, 98.5, 100.0),
+        ("2026-01-05", 101.5, 102.0, 101.0, 101.8),
+    ])}
+    led = add_picks(empty(), picks({"AAA": (100.0, 2.5)}), "2026-01-04", "v1", 10_000.0)
+    row = fill_pending(led, prices, "2026-01-05").iloc[0]
+    assert row["status"] == "open"
+    assert row["entry_date"] == "2026-01-05"
+    assert row["entry_price"] == pytest.approx(101.5)
+
+
+def test_time_exit_flags_at_56_days_not_55_with_daily_bars():
+    # Bars on every calendar day; close = 100 + 0.5*i, rising so no SMA50 signal.
+    dates = pd.date_range("2026-01-04", "2026-03-03", freq="D")
+    data = []
+    for i, dt in enumerate(dates):
+        c = 100.0 + 0.5 * i
+        data.append((dt, c - 0.25, c + 0.25, c - 0.5, c))
+    prices = {"AAA": bars(data)}
+    led = open_position(prices, pick_date="2026-01-04", fill_on="2026-01-05")
+    assert led.iloc[0]["entry_price"] == pytest.approx(100.25)
+
+    led, events = process_exits(led, prices, "2026-03-01")  # 55 days held
+    assert led.iloc[0]["pending_exit"] == ""
+    assert events == []
+
+    led, events = process_exits(led, prices, "2026-03-02")  # 56 days held
+    assert led.iloc[0]["pending_exit"] == "time_exit"
+    assert events == [{"ticker": "AAA", "pick_date": "2026-01-04", "kind": "time_exit",
+                       "price": pytest.approx(128.5), "date": "2026-03-02"}]

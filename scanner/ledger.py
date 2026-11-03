@@ -33,6 +33,7 @@ _KEY = ["pick_date", "ticker", "config_version"]
 
 SMA_EXIT = 50
 HOLD_DAYS_MAX = 56  # matches gates.hold_days_max in scanner.yaml
+MISMATCH_TOL = 0.03  # entry-bar Open vs stored entry_price; beyond this, skip + report
 
 
 def _day(value) -> str:
@@ -142,6 +143,17 @@ def fill_pending(ledger: pd.DataFrame, prices: dict, as_of) -> pd.DataFrame:
     return ledger
 
 
+def _entry_open(df: pd.DataFrame, entry_date: str) -> float | None:
+    """Open of the bar on entry_date, or None if that bar is missing/NaN."""
+    ts = pd.Timestamp(entry_date)
+    if ts not in df.index:
+        return None
+    value = df.loc[ts, "Open"]
+    if isinstance(value, pd.Series):
+        value = value.iloc[-1]
+    return float(value) if pd.notna(value) else None
+
+
 def _replay(row: pd.Series, df: pd.DataFrame, cutoff: pd.Timestamp) -> dict:
     """Walk bars from entry to cutoff and return the deterministic end state:
     {"closed": (date, price, reason) | None, "pending": str, "flag": (date, close) | None}."""
@@ -176,8 +188,16 @@ def process_exits(ledger: pd.DataFrame, prices: dict, as_of) -> tuple[pd.DataFra
         df = prices.get(row["ticker"])
         if df is None or df.empty:
             continue
-        state = _replay(row, df, cutoff)
         base = {"ticker": row["ticker"], "pick_date": row["pick_date"]}
+        observed = _entry_open(df, row["entry_date"])
+        entry_price = float(row["entry_price"])
+        if observed is None or abs(observed / entry_price - 1) > MISMATCH_TOL:
+            # Prices were likely re-adjusted (split/dividend) since entry; stored
+            # nominal entry/stop no longer match the bars. Skip and report.
+            events.append({**base, "kind": "data_mismatch", "price": entry_price,
+                           "date": row["entry_date"], "detail": observed})
+            continue
+        state = _replay(row, df, cutoff)
         stored = row["pending_exit"]
         if state["pending"] and state["pending"] != stored:
             fdate, fclose = state["flag"]
