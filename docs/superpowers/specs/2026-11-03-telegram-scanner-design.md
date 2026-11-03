@@ -110,6 +110,31 @@ Google Sheets mirror runs last and is one-way: tabs for picks, open positions, w
 by config version, latest scores. A mirror failure never blocks Telegram or the ledger.
 A separate user-notes tab is never written by the job.
 
+## 7b. Historical data archive
+
+Added 2026-11-03 at the user's request: record all the data the scanner sees, every
+run, so a true point-in-time dataset accumulates from day one.
+
+- What is archived per run: the S&P 500 constituent list as fetched, daily OHLCV for
+  the eligible universe, the fundamentals fields used, analyst consensus/target/revision
+  fields, earnings dates, and the computed scores for every ticker (not just the top 3).
+  Each snapshot carries a fetch timestamp and source name.
+- Append-only: snapshots are dated, never overwritten or edited. Corrections are new
+  snapshots.
+- Format: compressed parquet, one folder per run date (`YYYY/MM/DD/`).
+- Location: a Google Drive folder, written by the same Google service account used for
+  the Sheets mirror (the user shares the folder with the service account). Git holds
+  only the ledger and a small manifest (run date, file names, row counts, checksums), so
+  the repo stays small. GitHub Actions artifacts are not used as storage (they expire).
+- Failure rule: an archive failure is alerted but does not block Telegram or the ledger.
+  A run with a failed archive is marked in the manifest so gaps are visible.
+- Purpose: accumulating this data is what makes a later, honest point-in-time backtest
+  possible. It does not change the "no backtest in v1" decision.
+- Setup risk to verify first: service accounts have little or no Drive storage of their
+  own, so uploads may fail unless the folder lives in the user's Drive with enough free
+  space or in a shared drive. Confirm this with a test upload before relying on it.
+  Estimated volume is a few MB per run compressed (to be measured on the first runs).
+
 ## 8. Testing
 
 - Unit tests for each indicator and score on fixed fixtures.
