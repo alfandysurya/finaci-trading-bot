@@ -84,6 +84,19 @@ version; ledger results are reported per version and never pooled across version
 - Fractional shares cannot use good-till-cancelled orders on Pluang, so the stop
   is a monitored alert level, not a resting order. Behaviour to be tested.
 
+Exit rules (added 2026-11-03 while planning; proposed values, confirm in review):
+- Stop hit: paper position closes on the first daily bar whose Low is at or below the
+  stop, at min(stop, that bar's Open), so a gap-down exits at the open, not the stop.
+- Sell signal: close below SMA(50) raises an alert and the paper position closes at the
+  next open.
+- Time exit: alert at 8 weeks (56 calendar days) held; paper position closes at the
+  next open.
+- Entry: a weekly pick is "pending" until the next trading day's open bar exists, then
+  becomes "open" at that open price.
+- Paper account: starts at `paper_account.start_equity` in `scanner.yaml` (user must set
+  it to their real account size) and equals start equity plus realised P&L plus
+  unrealised P&L of open positions.
+
 ## 6. Ledger
 
 Plain files in git (CSV/parquet). One row per pick: ticker, pick date, entry
