@@ -262,8 +262,12 @@ def _commands(run: _Run, cfg: dict, paths: dict[str, Path], ledger: pd.DataFrame
     except Exception as exc:
         run.fail("telegram updates", exc)
         updates = []
-    # Belt and braces: never re-apply an update already acknowledged by the offset.
-    updates = [u for u in updates if offset is None or int(u.get("update_id", -1)) >= offset]
+    # No filtering by id: Telegram already honours the offset, and after a quiet week
+    # it may restart update_id at a random (possibly lower) value. Only drop updates
+    # whose update_id is missing or not an integer, which apply_commands cannot order.
+    updates = [u for u in updates if isinstance(u, dict)
+               and isinstance(u.get("update_id"), int)
+               and not isinstance(u.get("update_id"), bool)]
     settings, ledger, next_offset, replies = apply_commands(
         updates, settings, ledger, cfg, run.deps.chat_id)
     if next_offset is not None:  # no updates -> keep the stored offset

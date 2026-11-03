@@ -681,26 +681,68 @@ def test_offset_persisted_before_ledger_save_failure(cfg, state_dir, monkeypatch
     assert not any(m.startswith("rsi") for m in tg.sent)  # no reply before state is saved
 
 
-class RedeliveringTelegram(FakeTelegram):
-    """Returns every update regardless of offset (a redelivery)."""
+class FixedTelegram(FakeTelegram):
+    """Returns its updates whatever the offset (e.g. update_id restarted at random)."""
 
     def get_updates(self, offset):
         self.offsets.append(offset)
         return list(self.updates)
 
 
-def test_toggle_delivered_twice_flips_once(cfg, state_dir):
+def test_toggle_delivered_twice_flips_once(cfg, state_dir, monkeypatch):
+    """Crash after the toggle was applied in memory: at most once means the toggle is
+    lost (settings never saved) but the offset has moved, so it is never re-applied."""
+    from scanner import ledger as ledger_mod
     from scanner.pipeline import run_daily
 
     updates = [{"update_id": 7, "message": {"text": "/toggle rsi", "chat": {"id": 42}}}]
-    tg = RedeliveringTelegram(updates)
-    run_daily(cfg, make_deps(tg), DAILY_AS_OF, state_dir)
+    tg = FakeTelegram(updates)  # honours the offset, like Telegram
+
+    def boom(df, path):
+        raise OSError("disk full")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(ledger_mod, "write_ledger", boom)
+        with pytest.raises(RuntimeError):
+            run_daily(cfg, make_deps(tg), DAILY_AS_OF, state_dir)
+    assert json.loads((state_dir / "telegram_offset.json").read_text())["offset"] == 8
+
     run_daily(cfg, make_deps(tg), DAILY_AS_OF, state_dir)
 
-    settings = json.loads((state_dir / "settings.json").read_text())
-    assert "rsi" not in settings["toggles"]
-    assert [m for m in tg.sent if m.startswith("rsi")] == [tg.sent[0]]
     assert tg.offsets == [None, 8]
+    settings = json.loads((state_dir / "settings.json").read_text())
+    assert "toggles" not in settings  # preset unchanged: toggle lost, never flipped twice
+    assert not any(m.startswith("rsi") for m in tg.sent)
+
+
+def test_small_update_id_after_offset_reset_is_still_processed(cfg, state_dir):
+    from scanner.pipeline import run_daily
+
+    state_dir.mkdir(parents=True)
+    (state_dir / "telegram_offset.json").write_text(json.dumps({"offset": 5000}))
+    updates = [{"update_id": 17, "message": {"text": "/toggle rsi", "chat": {"id": 42}}}]
+    tg = FixedTelegram(updates)
+    run_daily(cfg, make_deps(tg), DAILY_AS_OF, state_dir)
+
+    assert tg.offsets == [5000]
+    assert "rsi" not in json.loads((state_dir / "settings.json").read_text())["toggles"]
+    assert json.loads((state_dir / "telegram_offset.json").read_text())["offset"] == 18
+
+
+def test_malformed_update_ids_are_skipped_not_fatal(cfg, state_dir):
+    from scanner.pipeline import run_daily
+
+    updates = [{"message": {"text": "/profile value", "chat": {"id": 42}}},
+               {"update_id": "x", "message": {"text": "/profile value", "chat": {"id": 42}}},
+               {"update_id": 3, "message": {"text": "/toggle rsi", "chat": {"id": 42}}}]
+    tg = FixedTelegram(updates)
+    res = run_daily(cfg, make_deps(tg), DAILY_AS_OF, state_dir)
+
+    assert res["errors"] == []
+    settings = json.loads((state_dir / "settings.json").read_text())
+    assert settings.get("profile", "balanced") == "balanced"
+    assert "rsi" not in settings["toggles"]
+    assert json.loads((state_dir / "telegram_offset.json").read_text())["offset"] == 4
 
 
 def test_unexpected_exception_alerts_and_propagates(cfg, state_dir, monkeypatch):
