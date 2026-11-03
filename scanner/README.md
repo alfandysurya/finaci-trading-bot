@@ -1,6 +1,6 @@
 # Telegram stock scanner: setup guide
 
-The scanner runs on GitHub Actions. Every Sunday evening it picks a stock and sends it to you on Telegram. Every weekday after the US market closes it updates a paper account and sends a short summary. Do these steps once, in order.
+The scanner runs on GitHub Actions. Every Sunday evening it chooses the week's top 3 picks and sends them to you on Telegram. Every weekday after the US market closes it updates a paper account and sends a short summary. Do these steps once, in order.
 
 ## Paper only
 
@@ -30,8 +30,7 @@ No orders are ever placed. The scanner only suggests and keeps a pretend record.
 
 ### 4. Share the Drive folder and a Google Sheet
 
-1. Open the Drive archive folder: https://drive.google.com/drive/folders/1WMlMlhfo9qGcnoAWESNs3WIp6bhv6qXH
-   Its id is `1WMlMlhfo9qGcnoAWESNs3WIp6bhv6qXH`. Share the folder with the service account's email as Editor.
+1. Open the Drive folder that will hold the archive. Its address looks like `https://drive.google.com/drive/folders/<your folder id>`: the folder id is the last part of that address, after `/folders/`. This is `DRIVE_FOLDER_ID`. Share the folder with the service account's email as Editor. A shared drive is the safest place for this folder, because service accounts have no storage of their own.
 2. Create a new Google Sheet and share it with the same email as Editor.
 3. Copy the sheet id from its URL: it is the long text between `/d/` and `/edit`. This is `SHEET_ID`.
 4. You can keep a tab called "Notes" for your own notes. The job only writes the tabs Picks, Open, WinLoss and Scores.
@@ -45,7 +44,7 @@ In GitHub: Settings, then "Secrets and variables", then Actions, then "New repos
 | `TELEGRAM_BOT_TOKEN` | The token from step 1 |
 | `TELEGRAM_CHAT_ID` | The chat id from step 2 |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | The whole contents of the JSON key file from step 3 |
-| `DRIVE_FOLDER_ID` | `1WMlMlhfo9qGcnoAWESNs3WIp6bhv6qXH` |
+| `DRIVE_FOLDER_ID` | `<your folder id>`: the folder id from step 4 |
 | `SHEET_ID` | The sheet id from step 4 |
 
 ### 6. Set your account size
@@ -54,7 +53,7 @@ Edit `scanner.yaml` and set `paper_account.start_equity` to your real account si
 
 ### 7. Check Drive access
 
-On your computer, set the five environment variables in your shell, then run:
+Do this early, before you rely on the schedule. On your computer, set `GOOGLE_SERVICE_ACCOUNT_JSON` and `DRIVE_FOLDER_ID` in your shell (`check-drive` needs only these two), then run:
 
 ```
 uv run python -m scanner check-drive
@@ -68,9 +67,13 @@ If you get a quota error, the folder must live in your own Drive (shared with th
 uv run python -m scanner weekly --dry-run
 ```
 
-This writes to `.dryrun/` and prints to the console. It does not touch Telegram or Google.
+This writes to `.dryrun/` and prints to the console. It does not touch Telegram or Google, and it leaves `scanner_state/` alone. It still downloads live data from Yahoo Finance and Wikipedia, so it needs an internet connection and takes a few minutes.
 
-### 9. Run it for real
+### 9. Allow the workflows to save state
+
+In GitHub, open Settings, then Actions, then General. Under "Workflow permissions", choose "Read and write permissions" and save. The jobs push `scanner_state/` back to `main` after each run, so also make sure `main` has no branch protection rule that blocks this push by the GitHub Actions bot.
+
+### 10. Run it for real
 
 In GitHub, open the Actions tab, choose "scanner-weekly", and press "Run workflow". Check Telegram for the message. After that, leave it alone: the schedule takes over (weekly on Sunday 22:00 UTC, daily on weekdays at 21:30 UTC).
 
@@ -84,7 +87,7 @@ Send these to the bot in Telegram. They take effect from the next run: the next 
 
 ## What the messages mean
 
-- Weekly message: this week's pick, with the suggested entry, stop, size and the reasons behind the score. The paper entry fills at the next Monday US open.
+- Weekly message: this week's top 3 picks (fewer if not enough stocks pass the checks), each with the suggested entry, stop, size and the reasons behind the score. The paper entry fills at the next Monday US open.
 - Daily message: what happened to open paper positions (stops, exits, fills) and the paper account's state.
 - Error alert: something failed. The state is still saved, and the next run tries again.
 
@@ -105,3 +108,9 @@ Keep the other files: `settings.json` (your profile and indicator choices), `tel
 - GitHub scheduled runs can be delayed by several minutes.
 - On US exchange holidays the weekday run still happens but finds no new price bar, so nothing changes.
 - The daily run is timed after the US close on purpose, so it never acts on a half-finished day. If you start it by hand while the US market is open (Monday to Friday, 09:30 to 16:15 New York time), it stops with an error instead of running.
+- New buys pause once paper equity is 20% below its peak, and the pause stays until you reset (see Reset). It does not lift by itself after positions are closed.
+- GitHub turns off scheduled workflows after 60 days without repository activity. The state commits after each run normally count as activity, but if the schedule stops, re-enable it in the Actions tab.
+- `config_version` covers only the profile, the indicator toggles and the weights. Editing `sizing:` or `gates:` in `scanner.yaml` does not start a new version, so results before and after such an edit are counted together.
+- The stop and quantity are worked out from the pick-day close, but the paper entry fills at the next open, so the real distance to the stop can differ a little.
+- Prices are adjusted for dividends, so a stop can shift slightly relative to past prices.
+- The archived `scores` file holds the scored candidates only. Stocks that failed a check (liquidity, trend, earnings, already held) are listed with their reason in `rejects`.

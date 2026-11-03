@@ -2,6 +2,7 @@
 import re
 from pathlib import Path
 
+import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -90,27 +91,75 @@ def test_no_literal_secrets():
         assert "echo" not in text
 
 
+DRIVE_ID_LIKE = re.compile(
+    r"(?<![A-Za-z0-9_-])(?=[A-Za-z0-9_-]*\d)(?=[A-Za-z0-9_-]*[A-Za-z])[A-Za-z0-9_-]{33}"
+    r"(?![A-Za-z0-9_-])")
+
+
 def test_readme_mentions_all_secret_names_and_folder_id():
+    """F-7: the README names every secret but never embeds the real Drive folder id."""
     text = README.read_text(encoding="utf-8")
     for secret in SECRETS:
         assert secret in text
-    assert FOLDER_ID in text
+    assert "<your folder id>" in text
+    assert "drive.google.com/drive/folders/<your folder id>" in text
+    assert FOLDER_ID not in text
+    assert not DRIVE_ID_LIKE.search(text), DRIVE_ID_LIKE.search(text)
     assert not re.search(r"\d{6,}:[A-Za-z0-9_-]{35}", text)
     assert "-----BEGIN" not in text
 
 
-def test_daily_has_market_hours_guard_before_scan():
-    st = steps(load("daily"))
+def test_drive_id_pattern_catches_real_ids():
+    assert DRIVE_ID_LIKE.search(f"id is {FOLDER_ID}.")
+    assert not DRIVE_ID_LIKE.search("GOOGLE_SERVICE_ACCOUNT_JSON and DRIVE_FOLDER_ID")
+
+
+@pytest.mark.parametrize("name", ["daily", "weekly"])
+def test_workflows_have_market_hours_guard_before_scan(name):
+    """C-1: weekly has the same guard as daily; Sunday (dow 7) stays allowed."""
+    st = steps(load(name))
     ids = [s.get("id") for s in st]
     assert "market-guard" in ids
     guard = st[ids.index("market-guard")]
-    scan = next(s for s in st if "python -m scanner daily" in s.get("run", ""))
+    scan = next(s for s in st if f"python -m scanner {name}" in s.get("run", ""))
     assert st.index(guard) < st.index(scan)
     run = guard["run"]
     assert "America/New_York" in run and "930" in run and "1615" in run
+    assert '"$dow" -le 5' in run  # weekdays only: the Sunday weekly run is allowed
     assert "Refusing to run: US market is open; run after 16:00 America/New_York" in run
     assert "exit 1" in run
     assert "if" not in scan or "always" not in str(scan["if"])
+
+
+def test_guard_steps_are_identical():
+    def guard(name):
+        st = steps(load(name))
+        return next(s for s in st if s.get("id") == "market-guard")["run"]
+    assert guard("weekly") == guard("daily")
+
+
+def test_gitignore_excludes_state_tmp_files():
+    lines = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert "scanner_state/*.tmp" in lines
+
+
+def test_readme_covers_setup_notes_and_known_limits():
+    """C-4 / C-5 wording and notes."""
+    text = README.read_text(encoding="utf-8")
+    assert "top 3 picks" in text
+    step7 = text.split("### 7.")[1].split("\n### ")[0]
+    assert "GOOGLE_SERVICE_ACCOUNT_JSON" in step7 and "DRIVE_FOLDER_ID" in step7
+    for other in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "SHEET_ID", "five"):
+        assert other not in step7
+    step8 = text.split("### 8.")[1].split("\n### ")[0]
+    assert "Yahoo" in step8 and "Wikipedia" in step8
+    limits = text.split("## Known limits")[1]
+    for phrase in ("20%", "reset", "60 days", "config_version", "sizing:", "gates:",
+                   "next open", "dividend", "rejects", "scores"):
+        assert phrase in limits, phrase
+    for phrase in ("check-drive", "shared drive", "Read and write permissions",
+                   "branch protection"):
+        assert phrase in text, phrase
 
 
 def test_readme_reset_names_state_json_and_command_timing():

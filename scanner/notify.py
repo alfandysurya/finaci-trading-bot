@@ -19,6 +19,12 @@ def _num(value, default=0.0) -> float:
     return default if f != f else f
 
 
+def _qty(value) -> str:
+    """Quantity rounded to 4 decimals, without trailing zeros (5 -> '5')."""
+    q = _num(value)
+    return f"{q:.4f}".rstrip("0").rstrip(".") or "0"
+
+
 def format_weekly(picks: pd.DataFrame, settings: dict, sizing: list[dict],
                   skipped: dict[str, str], stops: list[float] | None = None) -> str:
     skipped = skipped or {}
@@ -44,7 +50,7 @@ def format_weekly(picks: pd.DataFrame, settings: dict, sizing: list[dict],
         stop = f"{stops[i]:.2f}" if stops is not None and i < len(stops) else "n/a"
         lines.append(f"   entry ref {_num(row['close']):.2f} | stop {stop}")
         lines.append(
-            f"   qty {sz.get('quantity', 0)} | value {_num(sz.get('value')):.2f}"
+            f"   qty {_qty(sz.get('quantity', 0))} | value {_num(sz.get('value')):.2f}"
             f" | risk {_num(sz.get('risk_amount')):.2f}"
         )
         reasons = list(row.get("reasons") or [])
@@ -79,8 +85,31 @@ def _event_line(e: dict) -> str:
     return f"{kind}: {t}"
 
 
-def format_daily(events: list[dict], open_positions: pd.DataFrame, summary: pd.DataFrame) -> str:
-    lines = ["Daily update", ""]
+def format_summary(summary: pd.DataFrame) -> list[str]:
+    """Win/loss lines per config version (empty list when there are no closed trades)."""
+    if summary is None or not len(summary):
+        return []
+    lines = ["Results by config version:"]
+    for _, r in summary.iterrows():
+        lines.append(
+            f"- {r['config_version']}: {int(r['trades'])} trades, {int(r['wins'])} wins,"
+            f" {int(r['losses'])} losses, win rate {float(r['win_rate']) * 100:.0f}%,"
+            f" total P&L {float(r['total_pnl']):+.2f}"
+        )
+    return lines
+
+
+def format_daily(events: list[dict], open_positions: pd.DataFrame, summary: pd.DataFrame,
+                 positions: pd.DataFrame | None = None, account: dict | None = None) -> str:
+    """`positions` (optional) shares the index of `open_positions` and holds
+    last_close, unrealised and unrealised_pct for the rows it covers.
+    `account` (optional) holds equity, peak and drawdown_pct."""
+    lines = ["Daily update"]
+    if account:
+        lines.append(f"Paper equity {_num(account.get('equity')):.2f} "
+                     f"(peak {_num(account.get('peak')):.2f}, "
+                     f"drawdown {_num(account.get('drawdown_pct')):.1f}%)")
+    lines.append("")
     if events:
         lines.append("Events:")
         lines += [f"- {_event_line(e)}" for e in events]
@@ -89,21 +118,18 @@ def format_daily(events: list[dict], open_positions: pd.DataFrame, summary: pd.D
     lines.append("")
     if open_positions is not None and len(open_positions):
         lines.append("Open positions:")
-        for _, r in open_positions.iterrows():
-            lines.append(
-                f"- {r['ticker']}: qty {r['quantity']} | entry {_num(r['entry_price']):.2f}"
-                f" | stop {_num(r['stop']):.2f} | took it: {'yes' if r['took_it'] is True or r['took_it'] == True else 'no'}"
-            )
+        for idx, r in open_positions.iterrows():
+            line = (f"- {r['ticker']}: qty {_qty(r['quantity'])} | entry {_num(r['entry_price']):.2f}"
+                    f" | stop {_num(r['stop']):.2f} | took it: {'yes' if r['took_it'] is True or r['took_it'] == True else 'no'}")
+            if positions is not None and idx in positions.index:
+                p = positions.loc[idx]
+                line += (f" | last {_num(p['last_close']):.2f} | P&L {_num(p['unrealised']):+.2f}"
+                         f" ({_num(p['unrealised_pct']):+.1f}%)")
+            lines.append(line)
         lines.append("")
-    if summary is not None and len(summary):
-        lines.append("Results by config version:")
-        for _, r in summary.iterrows():
-            lines.append(
-                f"- {r['config_version']}: {int(r['trades'])} trades, {int(r['wins'])} wins,"
-                f" {int(r['losses'])} losses, win rate {float(r['win_rate']) * 100:.0f}%,"
-                f" total P&L {float(r['total_pnl']):+.2f}"
-            )
-        lines.append("")
+    summary_lines = format_summary(summary)
+    if summary_lines:
+        lines += summary_lines + [""]
     lines.append(FOOTER)
     return "\n".join(lines)
 

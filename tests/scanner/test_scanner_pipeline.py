@@ -75,13 +75,16 @@ _DEFAULT = object()
 
 
 def make_deps(telegram=None, prices=None, future_bar=False, drive=_DEFAULT, sheets=None,
-              price_calls=None, secrets=(), dry_run=False):
+              price_calls=None, secrets=(), dry_run=False, sp500=None, fundamentals=None,
+              analyst=None, fetch_error=None):
     from scanner.pipeline import Deps
 
     data = prices if prices is not None else synthetic_prices(
         TICKERS, start="2024-06-03", end="2026-10-30", seed=SEED)
 
     def fetch_prices(tickers, start):
+        if fetch_error is not None:
+            raise fetch_error
         if price_calls is not None:
             price_calls.append((list(tickers), start))
         out = {}
@@ -99,10 +102,10 @@ def make_deps(telegram=None, prices=None, future_bar=False, drive=_DEFAULT, shee
 
     return Deps(
         fetch_prices=fetch_prices,
-        fetch_fundamentals=_fundamentals,
-        fetch_analyst=_analyst,
+        fetch_fundamentals=fundamentals or _fundamentals,
+        fetch_analyst=analyst or _analyst,
         fetch_earnings=_earnings,
-        fetch_sp500=_sp500,
+        fetch_sp500=sp500 or _sp500,
         telegram=telegram if telegram is not None else FakeTelegram(),
         drive_upload=Recorder() if drive is _DEFAULT else drive,
         sheets_mirror=sheets if sheets is not None else Recorder(),
@@ -770,5 +773,320 @@ def test_drive_not_configured_outside_dry_run_alerts(cfg, state_dir):
     assert alerts == ["ALERT: drive upload failed - Drive not configured; archive not uploaded"]
     manifest = read_manifest(state_dir)
     assert len(manifest) == 7
-    assert manifest["archive_ok"].astype(str).eq("True").all()  # local files are fine
+    # F-4: never-uploaded files are recorded as archive_ok False.
+    assert manifest["archive_ok"].astype(str).eq("False").all()
     assert len(weekly_messages(tg)) == 1
+
+
+# ----------------------------------------------------------------- final fix wave
+def _state(state_dir):
+    return json.loads((state_dir / "state.json").read_text())
+
+
+class SelectiveTelegram(FakeTelegram):
+    """Fails any send whose text contains one of `fail_on`."""
+
+    def __init__(self, updates=None, fail_on=()):
+        super().__init__(updates)
+        self.fail_on = list(fail_on)
+
+    def send(self, text):
+        if any(f in text for f in self.fail_on):
+            raise RuntimeError("telegram down")
+        self.sent.append(text)
+
+
+# F-1 ------------------------------------------------------------------
+def test_failed_weekly_send_is_stored_for_redelivery(cfg, state_dir):
+    from scanner.pipeline import run_weekly
+
+    tg = SelectiveTelegram(fail_on=["Weekly picks"])
+    res = run_weekly(cfg, make_deps(tg), AS_OF, state_dir)
+
+    assert res["send_failed"] is True
+    stored = _state(state_dir)["undelivered"]
+    assert len(stored) == 1 and stored[0].startswith("Weekly picks")
+    assert len(read_ledger(state_dir / "ledger.csv")) == len(res["picks"]) > 0
+
+
+def test_failed_paused_and_daily_sends_are_stored(cfg, state_dir):
+    from scanner.pipeline import run_daily, run_weekly
+
+    state_dir.mkdir(parents=True)
+    (state_dir / "state.json").write_text(json.dumps({"peak_equity": 2000.0}))
+    tg = FakeTelegram(fail_send=True)
+    assert run_weekly(cfg, make_deps(tg), AS_OF, state_dir)["send_failed"] is True
+    assert run_daily(cfg, make_deps(tg), DAILY_AS_OF, state_dir)["send_failed"] is True
+    stored = _state(state_dir)["undelivered"]
+    assert stored[0].startswith("Buys paused") and stored[1].startswith("Daily update")
+
+
+def test_successful_run_has_send_failed_false(cfg, state_dir):
+    from scanner.pipeline import run_daily
+
+    res = run_daily(cfg, make_deps(FakeTelegram()), DAILY_AS_OF, state_dir)
+    assert res["send_failed"] is False
+    assert _state(state_dir)["undelivered"] == []
+
+
+def test_undelivered_resent_after_replies_and_before_own_message(cfg, state_dir):
+    from scanner.pipeline import run_daily
+
+    state_dir.mkdir(parents=True)
+    (state_dir / "state.json").write_text(json.dumps({"undelivered": ["old A", "old B"]}))
+    updates = [{"update_id": 1, "message": {"text": "/toggle rsi", "chat": {"id": 42}}}]
+    tg = FakeTelegram(updates)
+    res = run_daily(cfg, make_deps(tg), DAILY_AS_OF, state_dir)
+
+    assert tg.sent[0].startswith("rsi off")
+    assert tg.sent[1:3] == ["old A", "old B"]
+    assert tg.sent[3].startswith("Daily update")
+    assert _state(state_dir)["undelivered"] == []
+    assert res["send_failed"] is False
+
+
+def test_undelivered_keeps_only_failed_resends(cfg, state_dir):
+    from scanner.pipeline import run_daily
+
+    state_dir.mkdir(parents=True)
+    (state_dir / "state.json").write_text(json.dumps({"undelivered": ["old A", "old B"]}))
+    tg = SelectiveTelegram(fail_on=["old B"])
+    res = run_daily(cfg, make_deps(tg), DAILY_AS_OF, state_dir)
+
+    assert tg.sent[0] == "old A" and tg.sent[1].startswith("Daily update")
+    assert _state(state_dir)["undelivered"] == ["old B"]
+    assert res["send_failed"] is True
+
+
+def test_undelivered_is_capped_at_twenty(cfg, state_dir):
+    from scanner.pipeline import run_daily
+
+    state_dir.mkdir(parents=True)
+    old = [f"m{i}" for i in range(20)]
+    (state_dir / "state.json").write_text(json.dumps({"undelivered": old}))
+    run_daily(cfg, make_deps(FakeTelegram(fail_send=True)), DAILY_AS_OF, state_dir)
+
+    stored = _state(state_dir)["undelivered"]
+    assert len(stored) == 20
+    assert stored[:19] == old[1:]
+    assert stored[-1].startswith("Daily update")
+
+
+def test_cli_exits_nonzero_when_main_message_not_delivered(tmp_path, monkeypatch):
+    from scanner import cli
+
+    monkeypatch.setattr(cli, "ROOT", tmp_path)
+    deps = make_deps(FakeTelegram(fail_send=True))
+    monkeypatch.setattr(cli, "default_deps", lambda env, dry_run: deps)
+    state = tmp_path / "st"
+    assert cli.main(["daily", "--as-of", "2026-10-09", "--state-dir", str(state)],
+                    env={}) == 1
+    assert _state(state)["undelivered"][0].startswith("Daily update")
+
+    deps_ok = make_deps(FakeTelegram())
+    monkeypatch.setattr(cli, "default_deps", lambda env, dry_run: deps_ok)
+    assert cli.main(["daily", "--as-of", "2026-10-09", "--state-dir", str(state)],
+                    env={}) == 0
+
+
+# F-2 ------------------------------------------------------------------
+def test_daily_alerts_on_missing_and_stale_prices(cfg, state_dir):
+    from scanner.pipeline import run_daily
+
+    fresh = _bars(DAILY_AS_OF, 80)
+    stale = _bars(pd.Timestamp("2026-10-02"), 80)
+    _write_rows(state_dir, [
+        _ledger_row(pick_date="2026-09-01", ticker="AAA", status="open",
+                    entry_date="2026-09-02", entry_price=100.0, stop=50.0, quantity=1.0),
+        _ledger_row(pick_date="2026-09-01", ticker="BBB", status="open",
+                    entry_date="2026-09-02", entry_price=100.0, stop=50.0, quantity=1.0),
+        _ledger_row(pick_date="2026-09-01", ticker="CCC", status="pending",
+                    stop=50.0, quantity=1.0),
+    ])
+    tg = FakeTelegram()
+    run_daily(cfg, make_deps(tg, prices={"AAA": fresh, "CCC": stale}), DAILY_AS_OF, state_dir)
+
+    alerts = [m for m in tg.sent if m.startswith("ALERT: no fresh prices")]
+    assert alerts == ["ALERT: no fresh prices for BBB, CCC - stops not checked"]
+
+
+def test_daily_fresh_prices_send_no_staleness_alert(cfg, state_dir):
+    from scanner.pipeline import run_daily
+
+    _write_rows(state_dir, [_ledger_row(pick_date="2026-09-01", ticker="AAA", status="open",
+                                        entry_date="2026-09-02", entry_price=100.0,
+                                        stop=50.0, quantity=1.0)])
+    tg = FakeTelegram()
+    run_daily(cfg, make_deps(tg, prices={"AAA": _bars(pd.Timestamp("2026-10-05"), 80)}),
+              DAILY_AS_OF, state_dir)  # exactly 4 days old: still fresh
+    assert not any(m.startswith("ALERT") for m in tg.sent)
+
+
+def test_daily_fetch_failure_says_stops_not_checked(cfg, state_dir):
+    from scanner.pipeline import run_daily
+
+    state_dir.mkdir(parents=True)
+    (state_dir / "state.json").write_text(json.dumps({"peak_equity": 1234.0}))
+    _write_rows(state_dir, [
+        _ledger_row(pick_date="2026-09-01", ticker="AAA", status="open",
+                    entry_date="2026-09-02", entry_price=100.0, stop=50.0, quantity=1.0),
+        _ledger_row(pick_date="2026-08-01", ticker="ZZZ", status="closed",
+                    entry_date="2026-08-03", entry_price=100.0, stop=50.0, quantity=1.0,
+                    exit_date="2026-08-10", exit_price=110.0, exit_reason="sell_signal",
+                    pnl=10.0, outcome="win", config_version="v9"),
+    ])
+    tg = FakeTelegram()
+    res = run_daily(cfg, make_deps(tg, fetch_error=RuntimeError("yahoo down")), DAILY_AS_OF,
+                    state_dir)
+
+    assert len(tg.sent) == 1
+    msg = tg.sent[0]
+    assert msg.startswith("ALERT: prices unavailable - stops not checked today")
+    assert "No changes today" not in msg
+    assert "v9: 1 trades" in msg
+    assert _state(state_dir)["peak_equity"] == 1234.0
+    assert any("yahoo down" in e for e in res["errors"])
+    assert read_ledger(state_dir / "ledger.csv").iloc[0]["status"] == "open"
+
+
+def test_open_row_without_prices_excluded_from_peak(cfg, state_dir):
+    from scanner.pipeline import run_daily
+
+    _write_rows(state_dir, [
+        _ledger_row(pick_date="2026-09-01", ticker="AAA", status="open",
+                    entry_date="2026-09-02", entry_price=100.0, stop=50.0, quantity=1.0),
+        _ledger_row(pick_date="2026-09-01", ticker="BBB", status="open",
+                    entry_date="2026-09-02", entry_price=100.0, stop=50.0, quantity=1.0),
+    ])
+    prices = {"AAA": _bars(DAILY_AS_OF, 80, price=100.0)}
+    _set(prices["AAA"], "2026-10-09", Close=120.0, High=120.0)
+    run_daily(cfg, make_deps(FakeTelegram(), prices=prices), DAILY_AS_OF, state_dir)
+    assert _state(state_dir)["peak_equity"] == pytest.approx(1020.0)
+
+
+# F-3 ------------------------------------------------------------------
+def _big_universe(n_total, n_with_data):
+    tickers = [f"U{i:03d}" for i in range(n_total)]
+    data = synthetic_prices(tickers[:n_with_data], start="2024-06-03", end="2026-10-30",
+                            seed=SEED)
+
+    def sp500():
+        return pd.DataFrame({"ticker": tickers,
+                             "sector": [SECTORS[i % len(SECTORS)] for i in range(n_total)]})
+    return data, sp500
+
+
+def test_weekly_aborts_when_prices_cover_under_half(cfg, state_dir):
+    from scanner.pipeline import run_weekly
+
+    data, sp500 = _big_universe(100, 49)
+    tg = FakeTelegram()
+    res = run_weekly(cfg, make_deps(tg, prices=data, sp500=sp500), AS_OF, state_dir)
+
+    assert any("price data covers 49 of 100 constituents" in e for e in res["errors"])
+    assert any(m.startswith("ALERT: scan failed") for m in tg.sent)
+    assert weekly_messages(tg) == []
+    if (state_dir / "state.json").exists():
+        assert _state(state_dir).get("last_weekly_pick_date") is None
+    # A same-day rerun is allowed, and exactly 50% coverage is enough.
+    data, sp500 = _big_universe(100, 50)
+    again = run_weekly(cfg, make_deps(tg, prices=data, sp500=sp500), AS_OF, state_dir)
+    assert again["skipped_reason"] is None
+    assert not any("price data covers" in e for e in again["errors"])
+    assert len(weekly_messages(tg)) == 1
+
+
+NUM_FUND = ["pe", "ev_ebitda", "fcf_yield"]
+ANALYST = ["rec_mean", "target_gap", "rec_trend"]
+
+
+def _blanking(base, cols, extra, seen):
+    def fetch(tickers):
+        seen.append(len(tickers))
+        df = base(tickers)
+        if extra is not None:
+            k = len(tickers) * 30 // 100 + extra
+            df.loc[list(tickers)[:k], cols] = np.nan
+        return df
+    return fetch
+
+
+@pytest.mark.parametrize("which,extra,warn", [
+    ("fundamentals", 0, False), ("fundamentals", 1, True),
+    ("analyst", 0, False), ("analyst", 1, True)])
+def test_weekly_data_warning_threshold(cfg, state_dir, which, extra, warn):
+    from scanner.pipeline import run_weekly
+
+    data, sp500 = _big_universe(100, 100)
+    seen = []
+    kw = {"fundamentals": _blanking(_fundamentals, NUM_FUND,
+                                    extra if which == "fundamentals" else None, seen),
+          "analyst": _blanking(_analyst, ANALYST, extra if which == "analyst" else None, seen)}
+    tg = FakeTelegram()
+    res = run_weekly(cfg, make_deps(tg, prices=data, sp500=sp500, **kw), AS_OF, state_dir)
+
+    assert seen == [100, 100]  # all 100 eligible: 30 blanks == 30%, 31 == 31%
+    msg = weekly_messages(tg)[0]
+    assert ("DATA WARNING" in msg) is warn
+    assert any("DATA WARNING" in e for e in res["errors"]) is warn
+    if warn:
+        n = 31 if which == "fundamentals" else 0
+        k = 31 if which == "analyst" else 0
+        line = (f"DATA WARNING: fundamentals missing for {n}/100, analyst data missing for "
+                f"{k}/100 - scores for those groups are unreliable")
+        assert line in msg
+
+
+# F-5 ------------------------------------------------------------------
+def test_ledger_sizing_matches_message_with_custom_cfg(cfg, state_dir):
+    import re
+
+    from scanner.notify import _qty
+    from scanner.pipeline import run_weekly
+
+    cfg["sizing"].update({"risk_pct": 0.02, "cap_pct": 0.10, "stop_atr_mult": 3.0})
+    tg = FakeTelegram()
+    res = run_weekly(cfg, make_deps(tg), AS_OF, state_dir)
+    msg = weekly_messages(tg)[0]
+    ledger = read_ledger(state_dir / "ledger.csv").set_index("ticker")
+    assert len(res["picks"]) >= 1
+    for t, row in res["picks"].iterrows():
+        block = msg.split(f". {t} (")[1].split("\n\n")[0]
+        stop = float(re.search(r"stop (\d+\.\d+)", block).group(1))
+        qty = re.search(r"qty (\S+) \|", block).group(1)
+        assert round(ledger.loc[t, "stop"], 2) == stop
+        assert stop == pytest.approx(row["close"] - 3.0 * row["atr14"], abs=0.006)
+        assert _qty(ledger.loc[t, "quantity"]) == qty
+        assert ledger.loc[t, "quantity"] * row["close"] <= 0.10 * 1000 + 1e-6
+
+
+# F-6 ------------------------------------------------------------------
+def test_daily_message_shows_position_pnl_and_account(cfg, state_dir):
+    from scanner.pipeline import run_daily
+
+    df = _bars(DAILY_AS_OF, 80)
+    for d in ["2026-10-07", "2026-10-08", "2026-10-09"]:
+        _set(df, d, Open=110.0, High=110.0, Low=110.0, Close=110.0)
+    _write_rows(state_dir, [_ledger_row(pick_date="2026-10-01", ticker="AAA", status="open",
+                                        entry_date="2026-10-02", entry_price=100.0,
+                                        stop=50.0, quantity=2.0)])
+    tg = FakeTelegram()
+    run_daily(cfg, make_deps(tg, prices={"AAA": df}), DAILY_AS_OF, state_dir)
+    msg = tg.sent[-1]
+    assert "Paper equity 1020.00 (peak 1020.00, drawdown 0.0%)" in msg
+    assert "last 110.00 | P&L +20.00 (+10.0%)" in msg
+
+
+# C-3 ------------------------------------------------------------------
+def test_scan_failure_skips_sheets_mirror(cfg, state_dir):
+    from scanner.pipeline import run_weekly
+
+    def broken():
+        raise RuntimeError("wikipedia down")
+
+    sheets = Recorder()
+    tg = FakeTelegram()
+    res = run_weekly(cfg, make_deps(tg, sheets=sheets, sp500=broken), AS_OF, state_dir)
+    assert sheets.calls == []
+    assert any(m.startswith("ALERT: scan failed") for m in tg.sent)
+    assert res["archive_ok"] is False

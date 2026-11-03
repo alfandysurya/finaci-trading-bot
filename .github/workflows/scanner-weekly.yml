@@ -26,6 +26,17 @@ jobs:
 
       - uses: astral-sh/setup-uv@v5
 
+      - name: Refuse to run while the US market is open
+        id: market-guard
+        run: |
+          set -- $(TZ=America/New_York date '+%u %H%M')
+          dow=$1
+          hm=$((10#$2))
+          if [ "$dow" -le 5 ] && [ "$hm" -ge 930 ] && [ "$hm" -le 1615 ]; then
+            printf '%s\n' "Refusing to run: US market is open; run after 16:00 America/New_York" >&2
+            exit 1
+          fi
+
       - name: Install dependencies
         run: uv sync --frozen
 

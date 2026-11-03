@@ -20,7 +20,8 @@ from scanner import ledger as L
 from scanner.archive import append_manifest, write_snapshot
 from scanner.config import ROOT, active_settings
 from scanner.fetch import ANALYST_COLS, FUNDAMENTAL_COLS
-from scanner.notify import FOOTER, apply_commands, format_daily, format_weekly
+from scanner.notify import (FOOTER, apply_commands, format_daily, format_summary,
+                            format_weekly)
 from scanner.scoring import apply_gates, build_metric_table, score_table, select_top
 from scanner.sizing import buys_paused, open_risk_ok, size_position, stop_price
 from scanner.universe import liquidity_filter
@@ -35,6 +36,10 @@ SECRET_ENV = (ENV_TOKEN, ENV_CHAT, ENV_SA, ENV_DRIVE, ENV_SHEET)
 PRICE_CHUNK = 100
 LOOKBACK_DAYS = 400
 TOP_N = 3
+UNDELIVERED_CAP = 20      # stored undelivered messages (oldest dropped)
+MIN_PRICE_COVERAGE = 0.5  # weekly aborts below this share of constituents with prices
+DATA_WARN_PCT = 30        # warn when more than this % of eligible rows lack a data group
+FRESH_DAYS = 4            # daily: a held ticker's last bar must be within as_of - 4 days
 _MIN_SECRET_LEN = 4  # shorter values would mangle ordinary text when scrubbed
 
 
@@ -236,7 +241,11 @@ def _load(run: _Run, paths: dict[str, Path]):
         run.critical("ledger read", exc)
     try:
         settings = _read_json(paths["settings"], {"profile": "balanced"})
-        state = _read_json(paths["state"], {"peak_equity": None, "last_weekly_pick_date": None})
+        state = _read_json(paths["state"], {"peak_equity": None, "last_weekly_pick_date": None,
+                                            "undelivered": []})
+        if not isinstance(state["undelivered"], list) or not all(
+                isinstance(t, str) for t in state["undelivered"]):
+            raise ValueError("state.json 'undelivered' must be a list of strings")
     except Exception as exc:
         run.critical("state read", exc)
     return ledger, settings, state
@@ -340,13 +349,36 @@ def _mismatched(row: pd.Series, prices: dict) -> bool:
     return abs(float(observed) / float(row["entry_price"]) - 1) > L.MISMATCH_TOL
 
 
+def _unvalued(row: pd.Series, prices: dict) -> bool:
+    """An open row that cannot be valued: no price frame, or a data mismatch."""
+    df = prices.get(row["ticker"])
+    return df is None or df.empty or _mismatched(row, prices)
+
+
 def _valued_equity(ledger: pd.DataFrame, prices: dict, start_equity: float) -> float:
-    """ledger.equity() without open rows whose prices no longer match their entry
-    (split/dividend re-adjusted): those would be valued wrongly. Used by both runners."""
+    """ledger.equity() without open rows that cannot be valued: prices re-adjusted
+    since entry (split/dividend) or no price frame at all. Used by both runners."""
     is_open = ledger["status"] == "open"
-    bad = pd.Series([is_open.iloc[i] and _mismatched(ledger.iloc[i], prices)
+    bad = pd.Series([bool(is_open.iloc[i]) and _unvalued(ledger.iloc[i], prices)
                      for i in range(len(ledger))], index=ledger.index, dtype=bool)
     return L.equity(ledger[~bad], float(start_equity), prices)
+
+
+def _position_values(open_rows: pd.DataFrame, prices: dict) -> pd.DataFrame:
+    """last_close / unrealised / unrealised_pct per valuable open row (same index)."""
+    recs = {}
+    for idx, row in open_rows.iterrows():
+        if _unvalued(row, prices):
+            continue
+        closes = prices[row["ticker"]]["Close"].dropna()
+        entry, qty = _float(row["entry_price"], math.nan), _float(row["quantity"], math.nan)
+        if closes.empty or not (math.isfinite(entry) and entry > 0 and math.isfinite(qty)):
+            continue
+        last = float(closes.iloc[-1])
+        recs[idx] = {"last_close": last, "unrealised": qty * (last - entry),
+                     "unrealised_pct": (last / entry - 1) * 100}
+    return pd.DataFrame.from_dict(recs, orient="index",
+                                  columns=["last_close", "unrealised", "unrealised_pct"])
 
 
 def _row_risk(row: pd.Series, prices: dict) -> float:
@@ -410,6 +442,7 @@ def _upload_archive(run: _Run, day: str, rows: list[dict] | None, root: Path,
             ok = False
     elif rows is not None and not run.deps.dry_run:
         not_uploaded = True
+        ok = False  # never uploaded: the manifest must say so
     try:
         append_manifest(rows or [], manifest, failed=not ok, run_date=day)
     except Exception as exc:
@@ -418,7 +451,6 @@ def _upload_archive(run: _Run, day: str, rows: list[dict] | None, root: Path,
         msg = "Drive not configured; archive not uploaded"
         run.errors.append(msg)
         run.send(f"ALERT: drive upload failed - {msg}")
-        ok = False
     return ok
 
 
@@ -447,7 +479,54 @@ def _join_reasons(scored: pd.DataFrame) -> pd.DataFrame:
 
 def _result(run: _Run) -> dict:
     return {"picks": pd.DataFrame(), "events": [], "archive_ok": True, "errors": run.errors,
-            "sent": run.sent, "skipped_reason": None}
+            "sent": run.sent, "skipped_reason": None, "send_failed": False}
+
+
+def _store_undelivered(run: _Run, state: dict, paths: dict[str, Path], texts: list[str]) -> None:
+    state["undelivered"] = list(texts)[-UNDELIVERED_CAP:]  # drop oldest beyond the cap
+    _save_json(run, paths["state"], state)
+
+
+def _redeliver(run: _Run, state: dict, paths: dict[str, Path], res: dict) -> None:
+    """Re-send stored main messages (oldest first); keep only those that fail again."""
+    pending = list(state.get("undelivered") or [])
+    if not pending:
+        return
+    run.step = "redelivery"
+    left = [text for text in pending if not run.send(text)]
+    if left:
+        res["send_failed"] = True
+    _store_undelivered(run, state, paths, left)
+
+
+def _send_main(run: _Run, state: dict, paths: dict[str, Path], res: dict, text: str) -> None:
+    """Send a weekly/daily/paused message; on failure keep it for the next run and
+    mark the run so the CLI exits non-zero (after all state is saved)."""
+    if run.send(text):
+        return
+    res["send_failed"] = True
+    _store_undelivered(run, state, paths, list(state.get("undelivered") or []) + [text])
+
+
+def _data_warning(fund: pd.DataFrame, analyst: pd.DataFrame, eligible: list[str]) -> str | None:
+    m = len(eligible)
+    if not m:
+        return None
+    num_fund = [c for c in FUNDAMENTAL_COLS if c != "sector"]
+    n = int(fund.reindex(eligible, columns=num_fund).isna().all(axis=1).sum())
+    k = int(analyst.reindex(eligible, columns=ANALYST_COLS).isna().all(axis=1).sum())
+    if n * 100 > DATA_WARN_PCT * m or k * 100 > DATA_WARN_PCT * m:
+        return (f"DATA WARNING: fundamentals missing for {n}/{m}, analyst data missing for "
+                f"{k}/{m} - scores for those groups are unreliable")
+    return None
+
+
+def _with_warning(text: str, warning: str | None) -> str:
+    """Insert the warning line just above the footer."""
+    if not warning:
+        return text
+    lines = text.split("\n")
+    return "\n".join(lines[:-1] + [warning, ""] + lines[-1:])
 
 
 def _guarded(body, run: _Run, *args) -> dict:
@@ -477,6 +556,7 @@ def _weekly(run: _Run, cfg: dict, as_of: pd.Timestamp, state_dir: Path,
     run.step = "state load"
     ledger, settings, state = _load(run, paths)
     settings, ledger = _commands(run, cfg, paths, ledger, settings)
+    _redeliver(run, state, paths, res)
     run.step = "weekly run"
 
     if (ledger["pick_date"] == day).any() or state.get("last_weekly_pick_date") == day:
@@ -496,6 +576,10 @@ def _weekly(run: _Run, cfg: dict, as_of: pd.Timestamp, state_dir: Path,
         tickers = list(dict.fromkeys(list(constituents["ticker"]) + held))
         prices = _fetch_prices(run.deps, tickers, as_of)
         uni_prices = {t: prices[t] for t in constituents["ticker"] if t in prices}
+        total = len(constituents)
+        if total == 0 or len(uni_prices) < MIN_PRICE_COVERAGE * total:
+            # A data outage, not a quiet week: alert as a scan failure (no marker set).
+            raise RuntimeError(f"price data covers {len(uni_prices)} of {total} constituents")
         eligible, rejects = liquidity_filter(uni_prices, uni["min_dollar_volume"],
                                              uni["min_price"], uni.get("window", 20))
         for t in constituents["ticker"]:
@@ -507,6 +591,7 @@ def _weekly(run: _Run, cfg: dict, as_of: pd.Timestamp, state_dir: Path,
         peak = _float(state.get("peak_equity"))
         paused = buys_paused(equity, peak, sz["pause_drawdown_pct"])
         picks, sizing, stops, skipped, to_ledger = pd.DataFrame(), [], [], {}, []
+        warning = None
         if not paused:
             fund = (run.deps.fetch_fundamentals(eligible) if eligible
                     else pd.DataFrame(columns=FUNDAMENTAL_COLS))
@@ -514,6 +599,9 @@ def _weekly(run: _Run, cfg: dict, as_of: pd.Timestamp, state_dir: Path,
                        else pd.DataFrame(columns=ANALYST_COLS))
             earnings = (run.deps.fetch_earnings(eligible) if eligible
                         else pd.Series(dtype="datetime64[ns]"))
+            warning = _data_warning(fund, analyst, eligible)
+            if warning:
+                run.errors.append(warning)
             # One sector source for every ticker (GICS from the constituent list), so
             # the per-sector cap never counts one sector under two different labels.
             fund = fund.reindex(eligible).copy()
@@ -563,7 +651,9 @@ def _weekly(run: _Run, cfg: dict, as_of: pd.Timestamp, state_dir: Path,
                 picks = top.loc[accepted]
                 if to_ledger:
                     ledger = L.add_picks(ledger, top.loc[to_ledger], day, active["version"],
-                                         equity)
+                                         equity, stop_mult=sz["stop_atr_mult"],
+                                         risk_pct=sz["risk_pct"], cap_pct=sz["cap_pct"],
+                                         min_order=sz["min_order"])
         for t in held:  # every held ticker is reported as such, whatever else it failed
             rejects[t] = "already held"
         frames["scores"] = scores_tab
@@ -577,7 +667,7 @@ def _weekly(run: _Run, cfg: dict, as_of: pd.Timestamp, state_dir: Path,
             append_manifest([], paths["manifest"], failed=True, run_date=day)
         except Exception as mexc:
             run.fail("manifest", mexc)
-        _mirror(run, _mirror_tabs(ledger))
+        # No Sheets mirror here: `ledger` may hold picks that were never saved.
         return res
 
     _save_ledger(run, ledger, paths["ledger"])
@@ -593,9 +683,10 @@ def _weekly(run: _Run, cfg: dict, as_of: pd.Timestamp, state_dir: Path,
     run.step = "weekly message"
     if paused:
         drop = (1 - equity / peak) * 100
-        run.send(f"Buys paused: equity is {drop:.1f}% below peak\n{FOOTER}")
+        text = f"Buys paused: equity is {drop:.1f}% below peak\n{FOOTER}"
     else:
-        run.send(format_weekly(picks, active, sizing, skipped, stops))
+        text = _with_warning(format_weekly(picks, active, sizing, skipped, stops), warning)
+    _send_main(run, state, paths, res, text)
 
     res["archive_ok"] = _upload_archive(run, day, rows, root, paths["manifest"])
     run.step = "sheets mirror"
@@ -617,17 +708,31 @@ def _daily(run: _Run, cfg: dict, as_of: pd.Timestamp, state_dir: Path, root: Pat
     run.step = "state load"
     ledger, settings, state = _load(run, paths)
     settings, ledger = _commands(run, cfg, paths, ledger, settings)
+    _redeliver(run, state, paths, res)
     run.step = "daily positions"
 
     tickers = list(dict.fromkeys(_active_rows(ledger)["ticker"]))
     prices: dict[str, pd.DataFrame] = {}
-    fetched = True
     if tickers:
         try:
             prices = _fetch_prices(run.deps, tickers, as_of)
         except Exception as exc:
-            run.fail("fetch prices", exc)
-            fetched = False
+            # The daily message itself becomes the alert (below); peak stays unchanged.
+            run.errors.append(f"fetch prices: {run.describe(exc)}")
+            run.step = "daily message"
+            lines = ["ALERT: prices unavailable - stops not checked today"]
+            summary = format_summary(L.summary_by_version(ledger))
+            if summary:
+                lines += [""] + summary
+            _send_main(run, state, paths, res, "\n".join(lines))
+            run.step = "sheets mirror"
+            _mirror(run, _mirror_tabs(ledger))
+            return res
+
+    cutoff = as_of - pd.Timedelta(days=FRESH_DAYS)
+    unchecked = [t for t in tickers if t not in prices or _day(prices[t].index[-1]) < cutoff]
+    if unchecked:
+        run.send(f"ALERT: no fresh prices for {', '.join(unchecked)} - stops not checked")
 
     ledger = L.fill_pending(ledger, prices, as_of)
     ledger, events = L.process_exits(ledger, prices, as_of)
@@ -641,14 +746,18 @@ def _daily(run: _Run, cfg: dict, as_of: pd.Timestamp, state_dir: Path, root: Pat
     res["events"] = events
     _save_ledger(run, ledger, paths["ledger"])
 
-    if fetched:
-        equity = _valued_equity(ledger, prices, float(cfg["paper_account"]["start_equity"]))
-        state["peak_equity"] = max(_float(state.get("peak_equity")), equity)
-        _save_json(run, paths["state"], state)
+    equity = _valued_equity(ledger, prices, float(cfg["paper_account"]["start_equity"]))
+    peak = max(_float(state.get("peak_equity")), equity)
+    state["peak_equity"] = peak
+    _save_json(run, paths["state"], state)
 
     run.step = "daily message"
     open_rows = ledger[ledger["status"] == "open"]
-    run.send(format_daily(events, open_rows, L.summary_by_version(ledger)))
+    account = {"equity": equity, "peak": peak,
+               "drawdown_pct": (1 - equity / peak) * 100 if peak > 0 else 0.0}
+    _send_main(run, state, paths, res,
+               format_daily(events, open_rows, L.summary_by_version(ledger),
+                            positions=_position_values(open_rows, prices), account=account))
 
     if prices:
         run.step = "archive"

@@ -242,3 +242,40 @@ def test_profile_drops_custom_toggles():
     s = {"profile": "balanced", "toggles": ["rsi"]}
     new, _, _, _ = apply_commands([upd(1, "/profile balanced")], s, make_ledger(), CFG, "42")
     assert "toggles" not in new
+
+
+def test_quantities_are_rounded_to_four_decimals():
+    settings = active_settings(CFG, {"profile": "balanced"})
+    sizing = [{"quantity": 4.761904761904762, "value": 476.19, "risk_amount": 10.0,
+               "status": "ok"}, SIZING[1]]
+    text = format_weekly(picks_frame(), settings, sizing, {}, stops=[96.0, 48.0])
+    assert "qty 4.7619 " in text and "4.761904" not in text
+    assert "qty 20 " in text
+    op = pd.DataFrame([{"ticker": "TE", "quantity": 1.23456789, "entry_price": 10.0,
+                        "stop": 8.0, "took_it": False}])
+    daily = format_daily([], op, pd.DataFrame())
+    assert "qty 1.2346 " in daily and "1.234567" not in daily
+
+
+def test_format_daily_shows_position_pnl_and_account():
+    op = pd.DataFrame([{"ticker": "TE", "quantity": 2.0, "entry_price": 10.0, "stop": 8.0,
+                        "took_it": False},
+                       {"ticker": "TF", "quantity": 1.0, "entry_price": 50.0, "stop": 40.0,
+                        "took_it": True}], index=[3, 7])
+    positions = pd.DataFrame({"last_close": [12.0], "unrealised": [4.0],
+                              "unrealised_pct": [20.0]}, index=[3])
+    account = {"equity": 1104.5, "peak": 1200.0, "drawdown_pct": 7.958}
+    text = format_daily([], op, pd.DataFrame(), positions=positions, account=account)
+    assert "Paper equity 1104.50 (peak 1200.00, drawdown 8.0%)" in text
+    te = next(line for line in text.splitlines() if line.startswith("- TE"))
+    assert "last 12.00" in te and "P&L +4.00 (+20.0%)" in te
+    tf = next(line for line in text.splitlines() if line.startswith("- TF"))
+    assert "last" not in tf  # no price data for this row: shown as before
+
+
+def test_format_daily_without_new_args_is_unchanged():
+    op = pd.DataFrame([{"ticker": "TE", "quantity": 5, "entry_price": 10.0, "stop": 8.0,
+                        "took_it": True}])
+    text = format_daily([], op, pd.DataFrame())
+    assert "Paper equity" not in text and "last " not in text
+    assert "- TE: qty 5 | entry 10.00 | stop 8.00 | took it: yes" in text

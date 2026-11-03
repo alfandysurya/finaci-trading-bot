@@ -464,3 +464,27 @@ def test_time_exit_flags_at_56_days_not_55_with_daily_bars():
     assert led.iloc[0]["pending_exit"] == "time_exit"
     assert events == [{"ticker": "AAA", "pick_date": "2026-01-04", "kind": "time_exit",
                        "price": pytest.approx(128.5), "date": "2026-03-02"}]
+
+
+def test_add_picks_uses_given_sizing_parameters():
+    from scanner.sizing import size_position
+
+    # close 100, atr 2 -> stop 100 - 3*2 = 94; 2% of 10k / 6 = 33.3 shares, capped at
+    # 10% of 10k = 10 shares.
+    led = add_picks(empty(), picks({"AAA": (100.0, 2.0)}), "2026-01-02", "v1", 10_000.0,
+                    stop_mult=3.0, risk_pct=0.02, cap_pct=0.10, min_order=30.0)
+    row = led.iloc[0]
+    assert row["stop"] == pytest.approx(94.0)
+    expected = size_position(10_000.0, 100.0, 94.0, 0.02, 0.10, 30.0)
+    assert row["quantity"] == pytest.approx(expected["quantity"]) == pytest.approx(10.0)
+    # min_order is honoured too: a $5,000 floor makes this pick "below minimum".
+    small = add_picks(empty(), picks({"AAA": (100.0, 2.0)}), "2026-01-02", "v1", 10_000.0,
+                      min_order=5_000.0)
+    assert small.iloc[0]["status"] == "skipped"
+    assert small.iloc[0]["exit_reason"] == "below_minimum"
+
+
+def test_add_picks_defaults_unchanged():
+    led = add_picks(empty(), picks({"AAA": (100.0, 2.5)}), "2026-01-02", "v1", 10_000.0)
+    assert led.iloc[0]["stop"] == pytest.approx(95.0)
+    assert led.iloc[0]["quantity"] == pytest.approx(20.0)

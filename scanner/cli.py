@@ -99,5 +99,10 @@ def main(argv=None, env: Mapping[str, str] | None = None) -> int:
     print(f"messages sent: {len(result['sent'])}; archive ok: {result['archive_ok']}")
     for err in result["errors"]:
         print(f"error: {err}")
-    # Non-fatal errors (already alerted) exit 0 so the state files still get committed.
+    if result.get("send_failed"):
+        # All state is already saved (the message is queued in state.json for the next
+        # run); the workflow's commit step runs with if: always().
+        print("error: a weekly/daily message was not delivered; it will be re-sent next run")
+        return 1
+    # Other non-fatal errors (already alerted) exit 0.
     return 0

@@ -89,8 +89,10 @@ def _jsonable(value):
 
 
 def add_picks(ledger: pd.DataFrame, picks: pd.DataFrame, pick_date, version: str,
-              equity: float) -> pd.DataFrame:
-    """Append one row per pick unless (pick_date, ticker, version) already exists."""
+              equity: float, *, stop_mult: float = 2.0, risk_pct: float = 0.01,
+              cap_pct: float = 0.20, min_order: float = 30.0) -> pd.DataFrame:
+    """Append one row per pick unless (pick_date, ticker, version) already exists.
+    Sizing parameters must match the ones used for the pick message."""
     ledger = _coerce(ledger)
     day, version = _day(pick_date), str(version)
     existing = set(map(tuple, ledger[_KEY].to_numpy().tolist()))
@@ -101,8 +103,8 @@ def add_picks(ledger: pd.DataFrame, picks: pd.DataFrame, pick_date, version: str
             continue
         existing.add((day, ticker, version))
         close, atr = float(pick["close"]), float(pick["atr14"])
-        stop = stop_price(close, atr)
-        size = size_position(equity, close, stop)
+        stop = stop_price(close, atr, stop_mult)
+        size = size_position(equity, close, stop, risk_pct, cap_pct, min_order)
         ok = size["status"] == "ok"
         snapshot = {"ticker": ticker, **{str(k): v for k, v in pick.items()}}
         ts = pick.get("data_timestamp", None)
