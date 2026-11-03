@@ -50,6 +50,7 @@ class Deps:
     sheets_mirror: Callable[[dict[str, pd.DataFrame]], None] | None = None
     chat_id: str = "0"
     secrets: tuple[str, ...] = field(default=(), repr=False)
+    dry_run: bool = False
 
 
 # ------------------------------------------------------------ secrets / adapters
@@ -138,7 +139,7 @@ def default_deps(env: Mapping[str, str], dry_run: bool) -> Deps:
                   fetch_sp500=universe.fetch_sp500, secrets=secret_values(env))
     if dry_run:
         return Deps(telegram=ConsoleNotifier(), drive_upload=None, sheets_mirror=None,
-                    chat_id="0", **common)
+                    chat_id="0", dry_run=True, **common)
     missing = [k for k in (ENV_TOKEN, ENV_CHAT) if not env.get(k)]
     if missing:
         raise SystemExit("Missing required environment variable(s): " + ", ".join(missing)
@@ -161,6 +162,7 @@ class _Run:
         self.deps = deps
         self.errors: list[str] = []
         self.sent: list[str] = []
+        self.step = "startup"  # label for the catch-all alert in the runners
 
     def describe(self, exc: BaseException) -> str:
         return scrub(f"{type(exc).__name__}: {exc}", self.deps.secrets)
@@ -242,27 +244,35 @@ def _load(run: _Run, paths: dict[str, Path]):
 
 def _commands(run: _Run, cfg: dict, paths: dict[str, Path], ledger: pd.DataFrame,
               settings: dict):
-    """Apply queued Telegram commands. Persist ledger and settings first, then the
-    offset, then reply - so a crash never loses a command it already acknowledged."""
+    """Apply queued Telegram commands at most once.
+
+    The new offset is persisted FIRST, as soon as the commands are applied in memory,
+    so a crash afterwards can lose a command but never replay it (a replayed /toggle
+    would undo itself). Then ledger and settings are saved, then replies are sent.
+    A missing offset file means first run (offset None); an unreadable one aborts."""
+    run.step = "telegram commands"
     try:
         offset = _read_json(paths["offset"], {"offset": None}).get("offset")
+        if offset is not None and (isinstance(offset, bool) or not isinstance(offset, int)):
+            raise ValueError("telegram_offset.json holds a non-integer offset")
     except Exception as exc:
-        run.fail("telegram offset read", exc)
-        offset = None
+        run.critical("telegram offset read", exc)
     try:
         updates = run.deps.telegram.get_updates(offset)
     except Exception as exc:
         run.fail("telegram updates", exc)
         updates = []
+    # Belt and braces: never re-apply an update already acknowledged by the offset.
+    updates = [u for u in updates if offset is None or int(u.get("update_id", -1)) >= offset]
     settings, ledger, next_offset, replies = apply_commands(
         updates, settings, ledger, cfg, run.deps.chat_id)
-    _save_ledger(run, ledger, paths["ledger"])
-    _save_json(run, paths["settings"], settings)
     if next_offset is not None:  # no updates -> keep the stored offset
         try:
             _write_json(paths["offset"], {"offset": int(next_offset)})
         except Exception as exc:
-            run.fail("telegram offset write", exc)
+            run.critical("telegram offset write", exc)
+    _save_ledger(run, ledger, paths["ledger"])
+    _save_json(run, paths["settings"], settings)
     for reply in replies:
         run.send(reply)
     return settings, ledger
@@ -306,6 +316,33 @@ def _fetch_prices(deps: Deps, tickers: list[str], as_of: pd.Timestamp) -> dict:
 
 def _active_rows(ledger: pd.DataFrame) -> pd.DataFrame:
     return ledger[ledger["status"].isin(["open", "pending"])]
+
+
+def _mismatched(row: pd.Series, prices: dict) -> bool:
+    """Same test as scanner.ledger.process_exits: the entry-date bar's Open must exist
+    and lie within ledger.MISMATCH_TOL of the stored entry_price. Rows without price
+    data are not mismatches (process_exits skips them; equity() values them at 0)."""
+    df = prices.get(row["ticker"])
+    if df is None or df.empty:
+        return False
+    ts = pd.Timestamp(row["entry_date"])
+    if ts not in df.index:
+        return True
+    observed = df.loc[ts, "Open"]
+    if isinstance(observed, pd.Series):
+        observed = observed.iloc[-1]
+    if pd.isna(observed):
+        return True
+    return abs(float(observed) / float(row["entry_price"]) - 1) > L.MISMATCH_TOL
+
+
+def _valued_equity(ledger: pd.DataFrame, prices: dict, start_equity: float) -> float:
+    """ledger.equity() without open rows whose prices no longer match their entry
+    (split/dividend re-adjusted): those would be valued wrongly. Used by both runners."""
+    is_open = ledger["status"] == "open"
+    bad = pd.Series([is_open.iloc[i] and _mismatched(ledger.iloc[i], prices)
+                     for i in range(len(ledger))], index=ledger.index, dtype=bool)
+    return L.equity(ledger[~bad], float(start_equity), prices)
 
 
 def _row_risk(row: pd.Series, prices: dict) -> float:
@@ -353,18 +390,31 @@ def _write_archive(run: _Run, day: str, frames: dict, root: Path) -> list[dict] 
 
 def _upload_archive(run: _Run, day: str, rows: list[dict] | None, root: Path,
                     manifest: Path) -> bool:
-    """Upload written files to Drive, then record the manifest (failed rows on error)."""
+    """Upload written files to Drive, then record the manifest (failed rows on error).
+
+    Outside a dry run, a missing Drive configuration leaves the archive only on the
+    runner's disk (lost on GitHub Actions): the local manifest rows are kept as
+    written, but the result reports archive_ok False and one alert is sent."""
     ok = rows is not None
+    not_uploaded = False
     if rows is not None and run.deps.drive_upload is not None:
+        run.step = "drive upload"
         try:
             run.deps.drive_upload(root, [r["file"] for r in rows])
         except Exception as exc:
             run.fail("drive upload", exc)
             ok = False
+    elif rows is not None and not run.deps.dry_run:
+        not_uploaded = True
     try:
         append_manifest(rows or [], manifest, failed=not ok, run_date=day)
     except Exception as exc:
         run.fail("manifest", exc)
+    if not_uploaded:
+        msg = "Drive not configured; archive not uploaded"
+        run.errors.append(msg)
+        run.send(f"ALERT: drive upload failed - {msg}")
+        ok = False
     return ok
 
 
@@ -396,21 +446,34 @@ def _result(run: _Run) -> dict:
             "sent": run.sent, "skipped_reason": None}
 
 
-# ------------------------------------------------------------ weekly
-def run_weekly(cfg: dict, deps: Deps, as_of: pd.Timestamp, state_dir: Path) -> dict:
-    run = _Run(deps)
+def _guarded(body, run: _Run, *args) -> dict:
+    """Run a runner body. A state abort becomes RuntimeError (already alerted); any
+    other unexpected exception is alerted (scrubbed) under the current step and re-raised."""
     try:
-        return _weekly(run, cfg, _day(as_of), Path(state_dir))
+        return body(run, *args)
     except _Abort:
         raise RuntimeError("; ".join(run.errors)) from None
+    except Exception as exc:
+        run.fail(run.step, exc)
+        raise
 
 
-def _weekly(run: _Run, cfg: dict, as_of: pd.Timestamp, state_dir: Path) -> dict:
+# ------------------------------------------------------------ weekly
+def run_weekly(cfg: dict, deps: Deps, as_of: pd.Timestamp, state_dir: Path,
+               archive_root: Path | None = None) -> dict:
+    root = Path(archive_root) if archive_root is not None else _archive_root(cfg)
+    return _guarded(_weekly, _Run(deps), cfg, _day(as_of), Path(state_dir), root)
+
+
+def _weekly(run: _Run, cfg: dict, as_of: pd.Timestamp, state_dir: Path,
+            root: Path) -> dict:
     res = _result(run)
     paths = _paths(state_dir)
     day = as_of.strftime("%Y-%m-%d")
+    run.step = "state load"
     ledger, settings, state = _load(run, paths)
     settings, ledger = _commands(run, cfg, paths, ledger, settings)
+    run.step = "weekly run"
 
     if (ledger["pick_date"] == day).any() or state.get("last_weekly_pick_date") == day:
         res["skipped_reason"] = f"weekly already ran for {day}"
@@ -436,7 +499,7 @@ def _weekly(run: _Run, cfg: dict, as_of: pd.Timestamp, state_dir: Path) -> dict:
                 rejects[t] = "no_data"
         frames["prices"] = _prices_frame(prices, eligible)
 
-        equity = L.equity(ledger, start_equity, prices)
+        equity = _valued_equity(ledger, prices, start_equity)
         peak = _float(state.get("peak_equity"))
         paused = buys_paused(equity, peak, sz["pause_drawdown_pct"])
         picks, sizing, stops, skipped, to_ledger = pd.DataFrame(), [], [], {}, []
@@ -462,11 +525,14 @@ def _weekly(run: _Run, cfg: dict, as_of: pd.Timestamp, state_dir: Path) -> dict:
                 candidates, gate_rejects = apply_gates(
                     table, as_of, gates["stale_days"], gates["earnings_blackout_days"])
                 rejects.update(gate_rejects)
+                # Never re-pick a ticker that is already open or pending.
+                candidates = candidates.drop(index=[t for t in held if t in candidates.index])
                 if len(candidates):
                     scored = score_table(candidates, active)
             if scored is not None:
                 ranked = select_top(scored, n=len(scored), max_per_sector=len(scored))
                 scores_tab = _join_reasons(ranked)
+                # max_per_sector counts only this week's picks, not positions already held.
                 top = select_top(scored, n=TOP_N, max_per_sector=gates["max_per_sector"])
                 open_risks = [_row_risk(r, prices) for _, r in _active_rows(ledger).iterrows()]
                 accepted = []
@@ -494,6 +560,8 @@ def _weekly(run: _Run, cfg: dict, as_of: pd.Timestamp, state_dir: Path) -> dict:
                 if to_ledger:
                     ledger = L.add_picks(ledger, top.loc[to_ledger], day, active["version"],
                                          equity)
+        for t in held:  # every held ticker is reported as such, whatever else it failed
+            rejects[t] = "already held"
         frames["scores"] = scores_tab
         frames["rejects"] = pd.DataFrame({"ticker": list(rejects),
                                           "reason": list(rejects.values())},
@@ -515,9 +583,10 @@ def _weekly(run: _Run, cfg: dict, as_of: pd.Timestamp, state_dir: Path) -> dict:
 
     if paused:
         frames = {k: frames[k] for k in ("constituents", "prices")}
-    root = _archive_root(cfg)
+    run.step = "archive"
     rows = _write_archive(run, day, frames, root)
 
+    run.step = "weekly message"
     if paused:
         drop = (1 - equity / peak) * 100
         run.send(f"Buys paused: equity is {drop:.1f}% below peak\n{FOOTER}")
@@ -525,25 +594,26 @@ def _weekly(run: _Run, cfg: dict, as_of: pd.Timestamp, state_dir: Path) -> dict:
         run.send(format_weekly(picks, active, sizing, skipped, stops))
 
     res["archive_ok"] = _upload_archive(run, day, rows, root, paths["manifest"])
+    run.step = "sheets mirror"
     _mirror(run, _mirror_tabs(ledger, scores_tab))
     return res
 
 
 # ------------------------------------------------------------ daily
-def run_daily(cfg: dict, deps: Deps, as_of: pd.Timestamp, state_dir: Path) -> dict:
-    run = _Run(deps)
-    try:
-        return _daily(run, cfg, _day(as_of), Path(state_dir))
-    except _Abort:
-        raise RuntimeError("; ".join(run.errors)) from None
+def run_daily(cfg: dict, deps: Deps, as_of: pd.Timestamp, state_dir: Path,
+              archive_root: Path | None = None) -> dict:
+    root = Path(archive_root) if archive_root is not None else _archive_root(cfg)
+    return _guarded(_daily, _Run(deps), cfg, _day(as_of), Path(state_dir), root)
 
 
-def _daily(run: _Run, cfg: dict, as_of: pd.Timestamp, state_dir: Path) -> dict:
+def _daily(run: _Run, cfg: dict, as_of: pd.Timestamp, state_dir: Path, root: Path) -> dict:
     res = _result(run)
     paths = _paths(state_dir)
     day = as_of.strftime("%Y-%m-%d")
+    run.step = "state load"
     ledger, settings, state = _load(run, paths)
     settings, ledger = _commands(run, cfg, paths, ledger, settings)
+    run.step = "daily positions"
 
     tickers = list(dict.fromkeys(_active_rows(ledger)["ticker"]))
     prices: dict[str, pd.DataFrame] = {}
@@ -568,17 +638,16 @@ def _daily(run: _Run, cfg: dict, as_of: pd.Timestamp, state_dir: Path) -> dict:
     _save_ledger(run, ledger, paths["ledger"])
 
     if fetched:
-        mismatch = {e["ticker"] for e in events if e["kind"] == "data_mismatch"}
-        valued = ledger[~((ledger["status"] == "open") & ledger["ticker"].isin(mismatch))]
-        equity = L.equity(valued, float(cfg["paper_account"]["start_equity"]), prices)
+        equity = _valued_equity(ledger, prices, float(cfg["paper_account"]["start_equity"]))
         state["peak_equity"] = max(_float(state.get("peak_equity")), equity)
         _save_json(run, paths["state"], state)
 
+    run.step = "daily message"
     open_rows = ledger[ledger["status"] == "open"]
     run.send(format_daily(events, open_rows, L.summary_by_version(ledger)))
 
     if prices:
-        root = _archive_root(cfg)
+        run.step = "archive"
         d = pd.Timestamp(day)
         target = root / f"{d:%Y}" / f"{d:%m}" / f"{d:%d}" / "positions_prices.parquet"
         if not target.exists():  # a same-day re-run has already archived these prices
@@ -586,5 +655,6 @@ def _daily(run: _Run, cfg: dict, as_of: pd.Timestamp, state_dir: Path) -> dict:
                                   {"positions_prices": _prices_frame(prices, prices)}, root)
             res["archive_ok"] = _upload_archive(run, day, rows, root, paths["manifest"])
 
+    run.step = "sheets mirror"
     _mirror(run, _mirror_tabs(ledger))
     return res

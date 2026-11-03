@@ -71,8 +71,11 @@ class Recorder:
             raise self.fail
 
 
-def make_deps(telegram=None, prices=None, future_bar=False, drive=None, sheets=None,
-              price_calls=None, secrets=()):
+_DEFAULT = object()
+
+
+def make_deps(telegram=None, prices=None, future_bar=False, drive=_DEFAULT, sheets=None,
+              price_calls=None, secrets=(), dry_run=False):
     from scanner.pipeline import Deps
 
     data = prices if prices is not None else synthetic_prices(
@@ -101,10 +104,11 @@ def make_deps(telegram=None, prices=None, future_bar=False, drive=None, sheets=N
         fetch_earnings=_earnings,
         fetch_sp500=_sp500,
         telegram=telegram if telegram is not None else FakeTelegram(),
-        drive_upload=drive if drive is not None else Recorder(),
+        drive_upload=Recorder() if drive is _DEFAULT else drive,
         sheets_mirror=sheets if sheets is not None else Recorder(),
         chat_id="42",
         secrets=tuple(secrets),
+        dry_run=dry_run,
     )
 
 
@@ -554,3 +558,175 @@ def test_cli_check_drive_reports_error_and_exit_code(monkeypatch, capsys):
     monkeypatch.setattr(cli, "_check_drive", lambda env: "file-id-1")
     assert cli.main(["check-drive"], env={}) == 0
     assert "file-id-1" in capsys.readouterr().out
+
+
+# ----------------------------------------------------------------- review fixes (round 1)
+def _synthetic():
+    return synthetic_prices(TICKERS, start="2024-06-03", end="2026-10-30", seed=SEED)
+
+
+def _open_row(df, ticker, entry_date, entry_price=None, qty=0.1, stop=None):
+    entry = float(df.loc[pd.Timestamp(entry_date), "Open"]) if entry_price is None else entry_price
+    return _ledger_row(pick_date="2026-08-31", ticker=ticker, status="open",
+                       entry_date=entry_date, entry_price=entry,
+                       stop=entry * 0.9 if stop is None else stop, quantity=qty)
+
+
+def test_dry_run_default_paths_never_touch_real_state(tmp_path, monkeypatch):
+    from scanner import cli
+
+    monkeypatch.setattr(cli, "ROOT", tmp_path)
+    tg = FakeTelegram()
+    deps = make_deps(tg, drive=None, dry_run=True)
+    deps.sheets_mirror = None
+    monkeypatch.setattr(cli, "default_deps", lambda env, dry_run: deps)
+
+    assert cli.main(["weekly", "--dry-run", "--as-of", "2026-10-30"], env={}) == 0
+
+    assert not (tmp_path / "scanner_state").exists()
+    assert not (tmp_path / "data").exists()
+    assert (tmp_path / ".dryrun" / "state" / "ledger.csv").exists()
+    assert (tmp_path / ".dryrun" / "archive" / "2026" / "10" / "30" / "prices.parquet").exists()
+    # A dry run with no Drive is not an error.
+    assert not any(m.startswith("ALERT") for m in tg.sent)
+
+    args = cli.parse_args(["daily", "--dry-run", "--state-dir", str(tmp_path / "mine")])
+    state_dir, archive_root = cli.resolve_paths(args, BASE_CFG)
+    assert state_dir == tmp_path / "mine"
+    assert archive_root == tmp_path / ".dryrun" / "archive"
+    state_dir, archive_root = cli.resolve_paths(cli.parse_args(["daily"]), BASE_CFG)
+    assert state_dir == tmp_path / BASE_CFG["archive"]["state_dir"]
+    assert archive_root == tmp_path / BASE_CFG["archive"]["archive_dir"]
+
+
+def test_held_ticker_is_not_repicked(cfg, tmp_path):
+    from scanner.pipeline import run_weekly
+
+    control = run_weekly(cfg, make_deps(FakeTelegram()), AS_OF, tmp_path / "a")
+    first = control["picks"].index[0]
+
+    data = _synthetic()
+    state_b = tmp_path / "b"
+    _write_rows(state_b, [_open_row(data[first], first, "2026-09-01")])
+    cfg2 = copy.deepcopy(cfg)
+    cfg2["archive"]["archive_dir"] = str(tmp_path / "archive2")
+    res = run_weekly(cfg2, make_deps(FakeTelegram()), AS_OF, state_b)
+
+    assert first not in res["picks"].index
+    assert len(res["picks"]) >= 1
+    rejects = pd.read_parquet(tmp_path / "archive2" / "2026" / "10" / "30" / "rejects.parquet")
+    assert rejects.set_index("ticker").loc[first, "reason"] == "already held"
+    ledger = read_ledger(state_b / "ledger.csv")
+    assert (ledger["ticker"] == first).sum() == 1
+
+
+def test_split_adjusted_held_position_does_not_pause_or_shrink(cfg, tmp_path):
+    from scanner.pipeline import run_weekly
+
+    def seed_state(d):
+        d.mkdir(parents=True)
+        (d / "state.json").write_text(json.dumps({"peak_equity": 1000.0,
+                                                  "last_weekly_pick_date": None}))
+
+    seed_state(tmp_path / "a")
+    control = run_weekly(cfg, make_deps(FakeTelegram()), AS_OF, tmp_path / "a")
+
+    # T01 fails the trend gate anyway, so it cannot change the picks by itself.
+    data = _synthetic()
+    pre_split = 2 * float(data["T01"].loc[pd.Timestamp("2026-09-01"), "Open"])
+    state_b = tmp_path / "b"
+    seed_state(state_b)
+    _write_rows(state_b, [_open_row(data["T01"], "T01", "2026-09-01", entry_price=pre_split,
+                                    qty=3.0, stop=pre_split - 1)])
+    cfg2 = copy.deepcopy(cfg)
+    cfg2["archive"]["archive_dir"] = str(tmp_path / "archive2")
+    tg = FakeTelegram()
+    res = run_weekly(cfg2, make_deps(tg), AS_OF, state_b)
+
+    assert not any(m.startswith("Buys paused") for m in tg.sent)
+    assert list(res["picks"].index) == list(control["picks"].index)
+    qa = read_ledger(tmp_path / "a" / "ledger.csv").set_index("ticker")["quantity"]
+    qb = read_ledger(state_b / "ledger.csv").set_index("ticker")["quantity"]
+    for t in control["picks"].index:
+        assert qb[t] == pytest.approx(qa[t])
+
+
+def test_corrupt_offset_file_aborts_without_get_updates(cfg, state_dir):
+    from scanner.pipeline import run_weekly
+
+    state_dir.mkdir(parents=True)
+    (state_dir / "telegram_offset.json").write_text("{not json")
+    tg = FakeTelegram()
+    with pytest.raises(RuntimeError):
+        run_weekly(cfg, make_deps(tg), AS_OF, state_dir)
+    assert tg.offsets == []
+    assert any(m.startswith("ALERT: telegram offset read failed") for m in tg.sent)
+    assert not (state_dir / "ledger.csv").exists()
+
+
+def test_offset_persisted_before_ledger_save_failure(cfg, state_dir, monkeypatch):
+    from scanner import ledger as ledger_mod
+    from scanner.pipeline import run_daily
+
+    def boom(df, path):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(ledger_mod, "write_ledger", boom)
+    updates = [{"update_id": 9, "message": {"text": "/toggle rsi", "chat": {"id": 42}}}]
+    tg = FakeTelegram(updates)
+    with pytest.raises(RuntimeError):
+        run_daily(cfg, make_deps(tg), DAILY_AS_OF, state_dir)
+    assert json.loads((state_dir / "telegram_offset.json").read_text())["offset"] == 10
+    assert any(m.startswith("ALERT: ledger write failed") for m in tg.sent)
+    assert not any(m.startswith("rsi") for m in tg.sent)  # no reply before state is saved
+
+
+class RedeliveringTelegram(FakeTelegram):
+    """Returns every update regardless of offset (a redelivery)."""
+
+    def get_updates(self, offset):
+        self.offsets.append(offset)
+        return list(self.updates)
+
+
+def test_toggle_delivered_twice_flips_once(cfg, state_dir):
+    from scanner.pipeline import run_daily
+
+    updates = [{"update_id": 7, "message": {"text": "/toggle rsi", "chat": {"id": 42}}}]
+    tg = RedeliveringTelegram(updates)
+    run_daily(cfg, make_deps(tg), DAILY_AS_OF, state_dir)
+    run_daily(cfg, make_deps(tg), DAILY_AS_OF, state_dir)
+
+    settings = json.loads((state_dir / "settings.json").read_text())
+    assert "rsi" not in settings["toggles"]
+    assert [m for m in tg.sent if m.startswith("rsi")] == [tg.sent[0]]
+    assert tg.offsets == [None, 8]
+
+
+def test_unexpected_exception_alerts_and_propagates(cfg, state_dir, monkeypatch):
+    from scanner import pipeline
+
+    def broken(*a, **k):
+        raise ValueError("boom")
+
+    monkeypatch.setattr(pipeline, "format_weekly", broken)
+    tg = FakeTelegram()
+    with pytest.raises(ValueError, match="boom"):
+        pipeline.run_weekly(cfg, make_deps(tg), AS_OF, state_dir)
+    assert "ALERT: weekly message failed - ValueError: boom" in tg.sent
+
+
+def test_drive_not_configured_outside_dry_run_alerts(cfg, state_dir):
+    from scanner.pipeline import run_weekly
+
+    tg = FakeTelegram()
+    res = run_weekly(cfg, make_deps(tg, drive=None), AS_OF, state_dir)
+
+    assert res["archive_ok"] is False
+    assert "Drive not configured; archive not uploaded" in res["errors"]
+    alerts = [m for m in tg.sent if m.startswith("ALERT")]
+    assert alerts == ["ALERT: drive upload failed - Drive not configured; archive not uploaded"]
+    manifest = read_manifest(state_dir)
+    assert len(manifest) == 7
+    assert manifest["archive_ok"].astype(str).eq("True").all()  # local files are fine
+    assert len(weekly_messages(tg)) == 1

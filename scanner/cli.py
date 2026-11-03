@@ -12,6 +12,11 @@ from typing import Mapping
 
 import pandas as pd
 
+from scanner.config import ROOT, load_scanner_config
+from scanner.pipeline import default_deps, run_daily, run_weekly, scrub, secret_values
+
+DRYRUN_DIR = ".dryrun"  # dry runs never touch the real scanner_state/ or data/archive
+
 
 def _date(value: str) -> str:
     try:
@@ -30,7 +35,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--dry-run", action="store_true",
                    help="print messages instead of sending; skip Google Drive and Sheets")
     p.add_argument("--state-dir", default=None,
-                   help="state directory (default: scanner_state/ in the repo)")
+                   help="state directory (default: scanner_state/ in the repo; "
+                        ".dryrun/state with --dry-run)")
     return p.parse_args(argv)
 
 
@@ -51,9 +57,20 @@ def _check_drive(env: Mapping[str, str]) -> str:
     return check_drive_write(drive, env[ENV_DRIVE])
 
 
-def main(argv=None, env: Mapping[str, str] | None = None) -> int:
-    from scanner.pipeline import scrub, secret_values
+def resolve_paths(args: argparse.Namespace, cfg: dict) -> tuple[Path, Path]:
+    """(state_dir, archive_root). A dry run defaults both under ROOT/.dryrun; an
+    explicit --state-dir still wins for state."""
+    if args.dry_run:
+        state_default = ROOT / DRYRUN_DIR / "state"
+        archive_root = ROOT / DRYRUN_DIR / "archive"
+    else:
+        state_default = ROOT / cfg["archive"]["state_dir"]
+        archive_root = ROOT / cfg["archive"]["archive_dir"]
+    state_dir = Path(args.state_dir) if args.state_dir else state_default
+    return state_dir, archive_root
 
+
+def main(argv=None, env: Mapping[str, str] | None = None) -> int:
     args = parse_args(argv)
     env = os.environ if env is None else env
 
@@ -66,15 +83,12 @@ def main(argv=None, env: Mapping[str, str] | None = None) -> int:
         print(f"Drive write OK: test file {file_id} created and deleted")
         return 0
 
-    from scanner.config import ROOT, load_scanner_config
-    from scanner.pipeline import default_deps, run_daily, run_weekly
-
     cfg = load_scanner_config()
-    state_dir = Path(args.state_dir) if args.state_dir else ROOT / cfg["archive"]["state_dir"]
+    state_dir, archive_root = resolve_paths(args, cfg)
     deps = default_deps(env, dry_run=args.dry_run)
     as_of = resolve_as_of(args.as_of)
     runner = run_weekly if args.command == "weekly" else run_daily
-    result = runner(cfg, deps, as_of, state_dir)
+    result = runner(cfg, deps, as_of, state_dir, archive_root=archive_root)
 
     print(f"{args.command} run for {as_of:%Y-%m-%d} finished")
     if result.get("skipped_reason"):
