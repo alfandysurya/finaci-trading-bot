@@ -111,3 +111,36 @@ def test_manifest_appends_without_duplicating_header(tmp_path):
     assert len(lines) == 1 + 2 * len(rows)
     df = pd.read_csv(m)
     assert df["archive_ok"].all()
+
+
+def test_unserializable_frame_writes_nothing(tmp_path):
+    frames = {
+        "prices": pd.DataFrame({"a": [1]}),
+        "scores": pd.DataFrame({"a": [{1, 2}, "x"]}),
+    }
+    with pytest.raises(Exception):
+        write_snapshot("2026-11-03", frames, tmp_path)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_invalid_frame_name_rejected(tmp_path):
+    for bad in ["../x", "a/b"]:
+        with pytest.raises(ValueError):
+            write_snapshot("2026-11-03", {bad: pd.DataFrame({"a": [1]})}, tmp_path)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_empty_frame_round_trips(tmp_path):
+    df = pd.DataFrame({"a": pd.Series([], dtype="float64")})
+    rows = write_snapshot("2026-11-03", {"prices": df}, tmp_path)
+    assert rows[0]["rows"] == 0
+    back = pd.read_parquet(tmp_path / "2026/11/03/prices.parquet")
+    assert len(back) == 0 and list(back.columns) == ["a"]
+
+
+def test_datetime_index_round_trips(tmp_path):
+    idx = pd.DatetimeIndex(pd.to_datetime(["2026-11-02", "2026-11-03"]), name="date")
+    df = pd.DataFrame({"close": [1.0, 2.0]}, index=idx)
+    write_snapshot("2026-11-03", {"prices": df}, tmp_path)
+    back = pd.read_parquet(tmp_path / "2026/11/03/prices.parquet").set_index("date")
+    assert list(back.index) == list(idx)

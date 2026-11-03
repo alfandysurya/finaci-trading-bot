@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,12 +39,23 @@ def _parse_date(run_date: str) -> datetime:
 
 
 def write_snapshot(run_date: str, frames: dict[str, pd.DataFrame], root: Path) -> list[dict]:
+    """Write one parquet per frame; an unnamed non-default index comes back as an "index" column."""
     d = _parse_date(run_date)
     root = Path(root)
     day_dir = root / f"{d:%Y}" / f"{d:%m}" / f"{d:%d}"
     for name in frames:
         if not _NAME_RE.match(name):
             raise ValueError(f"invalid frame name {name!r}")
+    payloads: dict[str, bytes] = {}
+    for name, frame in frames.items():
+        if isinstance(frame.index, pd.RangeIndex) and frame.index.name is None:
+            out = frame
+        else:
+            out = frame.reset_index()
+        buf = io.BytesIO()
+        out.to_parquet(buf)
+        payloads[name] = buf.getvalue()
+
     targets = {name: day_dir / f"{name}.parquet" for name in frames}
     existing = [str(p) for p in targets.values() if p.exists()]
     if existing:
@@ -53,13 +65,9 @@ def write_snapshot(run_date: str, frames: dict[str, pd.DataFrame], root: Path) -
     rows: list[dict] = []
     for name, frame in frames.items():
         path = targets[name]
-        if isinstance(frame.index, pd.RangeIndex) and frame.index.name is None:
-            out = frame
-        else:
-            out = frame.reset_index()
+        data = payloads[name]
         with open(path, "xb") as fh:
-            out.to_parquet(fh)
-        data = path.read_bytes()
+            fh.write(data)
         rows.append(
             {
                 "run_date": run_date,
