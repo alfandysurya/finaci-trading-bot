@@ -80,10 +80,14 @@ def _validate_rel(rel: str) -> list[str]:
         not norm
         or p.is_absolute()
         or (len(norm) > 1 and norm[1] == ":")
+        or norm.endswith("/")
         or ".." in p.parts
     ):
         raise ValueError(f"unsafe archive path: {rel!r}")
-    return [s for s in p.parts if s not in ("", ".")]
+    parts = [s for s in p.parts if s not in ("", ".")]
+    if not parts:
+        raise ValueError(f"unsafe archive path: {rel!r}")
+    return parts
 
 
 def upload_to_drive(drive: Any, local_root: Path, rel_paths: list[str], folder_id: str) -> None:
@@ -142,7 +146,6 @@ def check_drive_write(drive: Any, folder_id: str) -> str:
             supportsAllDrives=True,
         ).execute()
         file_id = created["id"]
-        drive.files().delete(fileId=file_id, supportsAllDrives=True).execute()
     except HttpError as err:
         status = getattr(err.resp, "status", None)
         reasons = _reasons(err)
@@ -158,6 +161,13 @@ def check_drive_write(drive: Any, folder_id: str) -> str:
                 "as an editor (or the folder id is wrong)."
             ) from None
         raise RuntimeError(f"Drive write failed with HTTP status {status}.") from None
+    try:
+        drive.files().delete(fileId=file_id, supportsAllDrives=True).execute()
+    except Exception:
+        raise RuntimeError(
+            "Write test succeeded but the test file could not be deleted; "
+            f"remove file id {file_id} from the folder by hand."
+        ) from None
     return file_id
 
 
@@ -210,7 +220,7 @@ def mirror_to_sheets(sheets: Any, sheet_id: str, tabs: dict[str, pd.DataFrame]) 
                 body={"requests": [{"addSheet": {"properties": {"title": name}}}]},
             ).execute()
             existing.add(name)
-        rng = f"'{name}'"
+        rng = "'" + name.replace("'", "''") + "'"
         sheets.spreadsheets().values().clear(
             spreadsheetId=sheet_id, range=rng, body={}
         ).execute()

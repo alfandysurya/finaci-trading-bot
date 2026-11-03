@@ -254,3 +254,53 @@ def test_check_drive_write_deletes_test_file_and_returns_id():
     assert drive.deleted == [fid]
     assert drive.items == {}
     assert fid.startswith("id")
+
+
+# ------------------------------------------------------- fix round 1
+def test_mirror_escapes_single_quote_in_tab_name():
+    sh = FakeSheets(tabs=("Bob's",))
+    google_io.mirror_to_sheets(sh, "S", {"Bob's": pd.DataFrame({"a": [1]})})
+    assert sh.log[0] == ("clear", "'Bob''s'")
+    assert sh.log[1][1] == "'Bob''s'!A1"
+
+
+@pytest.mark.parametrize("exc", [_http_error(403, "forbidden"), ConnectionError("boom")])
+def test_check_drive_write_delete_failure_reports_file_id(exc):
+    drive = FakeDrive()
+
+    def bad_delete(fileId=None, supportsAllDrives=None):
+        def run():
+            raise exc
+
+        return _Req(run)
+
+    drive.delete = bad_delete
+    with pytest.raises(RuntimeError) as e:
+        google_io.check_drive_write(drive, FOLDER)
+    msg = str(e.value)
+    assert "could not be deleted" in msg and "id1" in msg
+    assert "editor" not in msg and "quota" not in msg.lower()
+
+
+@pytest.mark.parametrize("bad", [".", "", "2026/11/", "2026/"])
+def test_upload_rejects_empty_dot_and_trailing_slash(tmp_path, bad):
+    drive = FakeDrive()
+    with pytest.raises(ValueError):
+        google_io.upload_to_drive(drive, tmp_path, [bad], FOLDER)
+    assert drive.items == {}
+
+
+def test_q_escapes_backslash_and_quote():
+    assert google_io._q("a\\b'c") == "a\\\\b\\'c"
+
+
+def test_check_drive_write_non_quota_403_maps_to_not_shared():
+    drive = FakeDrive(create_error=_http_error(403, "rateLimitExceeded"))
+    with pytest.raises(RuntimeError, match="not shared with the service account as an editor"):
+        google_io.check_drive_write(drive, FOLDER)
+
+
+def test_check_drive_write_500_reports_status():
+    drive = FakeDrive(create_error=_http_error(500, "backendError"))
+    with pytest.raises(RuntimeError, match=r"Drive write failed with HTTP status 500\."):
+        google_io.check_drive_write(drive, FOLDER)
