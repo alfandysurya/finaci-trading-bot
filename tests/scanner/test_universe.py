@@ -54,3 +54,29 @@ def test_fetch_sp500_uses_read_html(monkeypatch):
     assert list(df.columns) == ["ticker", "sector"]
     assert df["ticker"].tolist() == ["AAPL", "BRK-B"]
     assert df["sector"].tolist() == ["Information Technology", "Financials"]
+
+
+def test_liquidity_filter_nan_latest_close_is_missing_data():
+    df = make_df(100, 1e9, bars=25)
+    df.iloc[-1, df.columns.get_loc("Close")] = float("nan")
+    ok, rej = liquidity_filter({"NAN": df}, 50_000_000, 5)
+    assert ok == [] and rej == {"NAN": "missing_data"}
+
+
+def test_liquidity_filter_nan_volume_is_missing_data():
+    df = make_df(100, 1e9, bars=25)
+    df["Volume"] = float("nan")
+    ok, rej = liquidity_filter({"NV": df}, 50_000_000, 5)
+    assert ok == [] and rej == {"NV": "missing_data"}
+
+
+def test_liquidity_filter_nan_padding_is_short_history():
+    df = make_df(100, 1e9, bars=25)
+    df.iloc[:10, df.columns.get_loc("Close")] = float("nan")
+    ok, rej = liquidity_filter({"PAD": df}, 50_000_000, 5)
+    assert ok == [] and rej == {"PAD": "short_history"}
+
+
+def test_liquidity_filter_short_history_precedes_price():
+    ok, rej = liquidity_filter({"BOTH": make_df(1, 1e9, bars=10)}, 50_000_000, 5)
+    assert ok == [] and rej == {"BOTH": "short_history"}

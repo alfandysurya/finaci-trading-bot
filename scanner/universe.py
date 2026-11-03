@@ -34,13 +34,17 @@ def liquidity_filter(
     eligible: list[str] = []
     rejected: dict[str, str] = {}
     for ticker, df in prices.items():
-        if len(df) < window:
+        if int(df["Close"].notna().sum()) < window:
             rejected[ticker] = "short_history"
             continue
-        if float(df["Close"].iloc[-1]) < min_price:
+        last_close = float(df["Close"].iloc[-1])
+        dollar_vol = float((df["Close"] * df["Volume"]).tail(window).mean(skipna=False))
+        if pd.isna(last_close) or pd.isna(dollar_vol):
+            rejected[ticker] = "missing_data"
+            continue
+        if last_close < min_price:
             rejected[ticker] = "price"
             continue
-        dollar_vol = float((df["Close"] * df["Volume"]).tail(window).mean())
         if dollar_vol < min_dollar_vol:
             rejected[ticker] = "dollar_volume"
             continue
