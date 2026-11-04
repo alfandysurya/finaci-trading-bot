@@ -11,6 +11,7 @@ import json
 import math
 import os
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -140,8 +141,13 @@ def default_deps(env: Mapping[str, str], dry_run: bool) -> Deps:
     from scanner import fetch, universe
     from scanner.notify import TelegramClient
 
-    common = dict(fetch_prices=fetch.fetch_prices, fetch_fundamentals=fetch.fetch_fundamentals,
-                  fetch_analyst=fetch.fetch_analyst, fetch_earnings=fetch.fetch_earnings,
+    # One rate-limit state per run (one run per process): once a fetch's breaker trips,
+    # the later fetches skip the long retry waits (see scanner.fetch).
+    rate = fetch.RateLimitState()
+    common = dict(fetch_prices=fetch.fetch_prices,
+                  fetch_fundamentals=partial(fetch.fetch_fundamentals, rate_state=rate),
+                  fetch_analyst=partial(fetch.fetch_analyst, rate_state=rate),
+                  fetch_earnings=partial(fetch.fetch_earnings, rate_state=rate),
                   fetch_sp500=universe.fetch_sp500, secrets=secret_values(env))
     if dry_run:
         return Deps(telegram=ConsoleNotifier(), drive_upload=None, sheets_mirror=None,
@@ -640,13 +646,10 @@ def _weekly(run: _Run, cfg: dict, as_of: pd.Timestamp, state_dir: Path,
             # liquid universe, so the slow per-ticker Yahoo calls below are made only
             # for the stocks that can still be picked.
             survivors = _price_survivors(prices, eligible, gics, held, as_of, gates, rejects)
-            # Stage 2: fundamentals, analyst and earnings for the survivors only. The
+            # Stage 2: earnings, fundamentals and analyst for the survivors only. The
             # archived fundamentals/analyst/earnings frames therefore cover these
-            # stage-2 tickers, not the whole liquid universe.
-            fund = (run.deps.fetch_fundamentals(survivors) if survivors
-                    else pd.DataFrame(columns=FUNDAMENTAL_COLS))
-            analyst = (run.deps.fetch_analyst(survivors) if survivors
-                       else pd.DataFrame(columns=ANALYST_COLS))
+            # stage-2 tickers, not the whole liquid universe. Earnings come first, so a
+            # blind blackout aborts after one slow fetch, not three.
             earnings = (run.deps.fetch_earnings(survivors) if survivors
                         else pd.Series(dtype="datetime64[ns]"))
             unknown = _unknown_earnings(earnings, survivors)
@@ -655,6 +658,10 @@ def _weekly(run: _Run, cfg: dict, as_of: pd.Timestamp, state_dir: Path,
                 # scan failure (no marker, no ledger rows), so a rerun later is allowed.
                 raise RuntimeError(f"earnings dates unknown for {unknown}/{len(survivors)} "
                                    "stocks - earnings blackout cannot be checked")
+            fund = (run.deps.fetch_fundamentals(survivors) if survivors
+                    else pd.DataFrame(columns=FUNDAMENTAL_COLS))
+            analyst = (run.deps.fetch_analyst(survivors) if survivors
+                       else pd.DataFrame(columns=ANALYST_COLS))
             warning = _data_warning(fund, analyst, earnings, survivors)
             if warning:
                 run.errors.append(warning)

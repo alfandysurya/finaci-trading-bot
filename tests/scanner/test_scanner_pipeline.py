@@ -1131,8 +1131,9 @@ def test_weekly_stage2_fetches_only_stage1_survivors(cfg, tmp_path):
 
     # Stage 1 keeps T00/T02/T05/T07/T11 (trend + momentum); T00 is held, so it is dropped.
     survivors = ["T02", "T05", "T07", "T11"]
-    assert log == [("fundamentals", survivors), ("analyst", survivors),
-                   ("earnings", survivors)]
+    # Earnings first, so a blind blackout aborts after one fetch, not three.
+    assert log == [("earnings", survivors), ("fundamentals", survivors),
+                   ("analyst", survivors)]
     assert len(res["picks"]) >= 1
     day = tmp_path / "archive" / "2026" / "10" / "30"
     rejects = pd.read_parquet(day / "rejects.parquet").set_index("ticker")["reason"]
@@ -1263,3 +1264,28 @@ def test_cli_prints_elapsed_time(tmp_path, monkeypatch, capsys):
     for cmd, day in [("weekly", "2026-10-30"), ("daily", "2026-10-09")]:
         assert cli.main([cmd, "--as-of", day, "--state-dir", str(state)], env={}) == 0
         assert re.search(r"^elapsed \d+s$", capsys.readouterr().out, re.M), cmd
+
+
+def test_weekly_earnings_abort_skips_fundamentals_and_analyst(cfg, state_dir):
+    from scanner.pipeline import run_weekly
+
+    log = []
+    deps = make_deps(FakeTelegram(),
+                     fundamentals=_recording(_fundamentals, log, "fundamentals"),
+                     analyst=_recording(_analyst, log, "analyst"),
+                     earnings=_recording(_unknown_earnings(99), log, "earnings"))
+    res = run_weekly(cfg, deps, AS_OF, state_dir)
+    assert [name for name, _ in log] == ["earnings"]
+    assert any("earnings dates unknown for 5/5" in e for e in res["errors"])
+
+
+def test_default_deps_share_one_rate_limit_state():
+    from scanner.fetch import RateLimitState
+    from scanner.pipeline import default_deps
+
+    deps = default_deps({}, dry_run=True)
+    states = [getattr(fn, "keywords", {}).get("rate_state")
+              for fn in (deps.fetch_earnings, deps.fetch_fundamentals, deps.fetch_analyst)]
+    assert isinstance(states[0], RateLimitState)
+    assert states[0] is states[1] is states[2]
+    assert default_deps({}, dry_run=True).fetch_earnings.keywords["rate_state"] is not states[0]

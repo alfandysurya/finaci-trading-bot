@@ -8,6 +8,7 @@ BREAKER_AFTER consecutive tickers stayed rate limited (their rows are left empty
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from typing import Any, Callable, Sequence
 
 import numpy as np
@@ -23,6 +24,23 @@ _ALL_COLS = ["strongBuy", "buy", "hold", "sell", "strongSell"]
 MIN_INTERVAL = 0.25          # seconds between tickers
 RETRY_WAITS = (5, 15, 45)    # seconds before each retry of a rate-limited ticker
 BREAKER_AFTER = 8            # consecutive rate-limited tickers before giving up the fetch
+
+# Worst-case wall time when Yahoo refuses everything:
+# - the first fetch to trip spends BREAKER_AFTER x (5 + 15 + 45) s = 8 x 65 s = 520 s,
+#   about 8.7 min, before its breaker trips;
+# - every later fetch sharing the same RateLimitState runs without retries, so it trips
+#   after 8 single attempts and 7 x 0.25 s pauses: a few seconds.
+# So a fully rate-limited weekly run spends about 9 min in these fetches (the weekly
+# fetches earnings first and aborts right after it), under the 15-minute budget and
+# the 30-minute workflow timeout.
+
+
+@dataclass
+class RateLimitState:
+    """Shared by the fetches of one run: once any breaker trips, later fetches make a
+    single attempt per ticker instead of waiting through the retries again."""
+
+    tripped: bool = False
 
 
 def _sleep(seconds: float) -> None:  # module-level so tests can replace it
@@ -112,9 +130,12 @@ def _is_rate_limit(exc: BaseException) -> bool:
 
 
 def _collect(tickers, ticker_factory, row_fn, empty_row, label, *, sleep=None,
-             min_interval=MIN_INTERVAL, retry_waits=RETRY_WAITS, breaker_after=BREAKER_AFTER):
+             min_interval=MIN_INTERVAL, retry_waits=RETRY_WAITS, breaker_after=BREAKER_AFTER,
+             rate_state=None):
     make = _default_factory(ticker_factory)
     sleep = _sleep if sleep is None else sleep
+    if rate_state is not None and rate_state.tripped:
+        retry_waits = ()  # no-retry mode: an earlier fetch in this run already tripped
     tickers = list(tickers)
     rows = {}
     limited = 0  # consecutive tickers that ended rate limited
@@ -140,13 +161,15 @@ def _collect(tickers, ticker_factory, row_fn, empty_row, label, *, sleep=None,
                     continue
                 print(f"[fetch] {label} failed for {t}: {type(exc).__name__}: {exc}")
                 limited = limited + 1 if rate_limited else 0
+                if limited >= breaker_after and rate_state is not None:
+                    rate_state.tripped = True  # even when this was the last ticker
                 break
     return rows
 
 
-def _throttle(sleep, min_interval, retry_waits, breaker_after) -> dict:
+def _throttle(sleep, min_interval, retry_waits, breaker_after, rate_state) -> dict:
     return {"sleep": sleep, "min_interval": min_interval, "retry_waits": tuple(retry_waits),
-            "breaker_after": breaker_after}
+            "breaker_after": breaker_after, "rate_state": rate_state}
 
 
 def fetch_fundamentals(tickers: list[str],
@@ -154,11 +177,12 @@ def fetch_fundamentals(tickers: list[str],
                        *, sleep: Callable[[float], None] | None = None,
                        min_interval: float = MIN_INTERVAL,
                        retry_waits: Sequence[float] = RETRY_WAITS,
-                       breaker_after: int = BREAKER_AFTER) -> pd.DataFrame:
+                       breaker_after: int = BREAKER_AFTER,
+                       rate_state: RateLimitState | None = None) -> pd.DataFrame:
     empty = {"pe": np.nan, "ev_ebitda": np.nan, "fcf_yield": np.nan, "sector": None}
     rows = _collect(tickers, ticker_factory, lambda tk: _fundamentals_row(tk.info or {}),
                     empty, "fundamentals", **_throttle(sleep, min_interval, retry_waits,
-                                                       breaker_after))
+                                                       breaker_after, rate_state))
     df = pd.DataFrame.from_dict(rows, orient="index", columns=FUNDAMENTAL_COLS)
     return df.reindex(list(tickers))
 
@@ -168,10 +192,12 @@ def fetch_analyst(tickers: list[str],
                   *, sleep: Callable[[float], None] | None = None,
                   min_interval: float = MIN_INTERVAL,
                   retry_waits: Sequence[float] = RETRY_WAITS,
-                  breaker_after: int = BREAKER_AFTER) -> pd.DataFrame:
+                  breaker_after: int = BREAKER_AFTER,
+                  rate_state: RateLimitState | None = None) -> pd.DataFrame:
     empty = {c: np.nan for c in ANALYST_COLS}
     rows = _collect(tickers, ticker_factory, _analyst_row, empty, "analyst",
-                    **_throttle(sleep, min_interval, retry_waits, breaker_after))
+                    **_throttle(sleep, min_interval, retry_waits, breaker_after,
+                                rate_state))
     df = pd.DataFrame.from_dict(rows, orient="index", columns=ANALYST_COLS).astype(float)
     return df.reindex(list(tickers))
 
@@ -181,8 +207,10 @@ def fetch_earnings(tickers: list[str],
                    *, sleep: Callable[[float], None] | None = None,
                    min_interval: float = MIN_INTERVAL,
                    retry_waits: Sequence[float] = RETRY_WAITS,
-                   breaker_after: int = BREAKER_AFTER) -> pd.Series:
+                   breaker_after: int = BREAKER_AFTER,
+                   rate_state: RateLimitState | None = None) -> pd.Series:
     rows = _collect(tickers, ticker_factory, _next_earnings, pd.NaT, "earnings",
-                    **_throttle(sleep, min_interval, retry_waits, breaker_after))
+                    **_throttle(sleep, min_interval, retry_waits, breaker_after,
+                                rate_state))
     s = pd.Series({t: rows[t] for t in tickers}, dtype="datetime64[ns]")
     return s.reindex(list(tickers))

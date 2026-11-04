@@ -230,3 +230,68 @@ def test_breaker_fills_analyst_rows_with_nan():
                        min_interval=0)
     assert list(df.index) == tickers
     assert df.isna().all().all()
+
+
+# ----------------------------------------------------------------- shared rate-limit state
+def test_tripped_breaker_makes_later_fetches_skip_long_waits(capsys):
+    from scanner.fetch import RateLimitState
+
+    state = RateLimitState()
+    assert state.tripped is False
+    limited = [f"R{i}" for i in range(10)]
+    make = Counting({t: Flaky([YFRateLimitError("x")] * 99) for t in limited})
+    first = SleepLog()
+    fetch_earnings(limited, ticker_factory=make, sleep=first, min_interval=0.25,
+                   rate_state=state)
+    assert state.tripped is True
+    assert 45 in first.calls
+
+    # Next fetch in the same run: one attempt per ticker, only the min-interval pauses,
+    # and the breaker still bails out after 8 consecutive rate-limited tickers.
+    make2 = Counting({t: Flaky([YFRateLimitError("x")] * 99) for t in limited})
+    second = SleepLog()
+    df = fetch_fundamentals(limited, ticker_factory=make2, sleep=second, min_interval=0.25,
+                            rate_state=state)
+    assert set(second.calls) == {0.25}
+    assert make2.calls == limited[:8]
+    assert df["pe"].isna().all()
+    assert "skipping 2 remaining fundamentals" in capsys.readouterr().out
+
+
+def test_breaker_trip_on_last_ticker_marks_state():
+    from scanner.fetch import RateLimitState
+
+    state = RateLimitState()
+    tickers = [f"R{i}" for i in range(8)]
+    make = Counting({t: Flaky([YFRateLimitError("x")] * 99) for t in tickers})
+    fetch_earnings(tickers, ticker_factory=make, sleep=SleepLog(), min_interval=0,
+                   rate_state=state)
+    assert state.tripped is True
+
+
+def test_no_retry_mode_still_fetches_good_tickers():
+    from scanner.fetch import RateLimitState
+
+    state = RateLimitState(tripped=True)
+    f = factory({"A": FakeTicker({"trailingPE": 7.0})})
+    sleep = SleepLog()
+    an = fetch_analyst(["A"], ticker_factory=f, sleep=sleep, rate_state=state)
+    df = fetch_fundamentals(["A"], ticker_factory=f, sleep=sleep, rate_state=state)
+    assert df.loc["A", "pe"] == 7.0 and list(an.index) == ["A"]
+    assert sleep.calls == []
+
+
+def test_fetch_signatures_stay_backward_compatible():
+    import inspect
+
+    f = factory({"A": FakeTicker({"trailingPE": 2.0}, calendar={})})
+    assert fetch_fundamentals(["A"], f).loc["A", "pe"] == 2.0  # positional factory
+    assert list(fetch_analyst(["A"], f).index) == ["A"]
+    assert pd.isna(fetch_earnings(["A"], f)["A"])
+    for fn in (fetch_fundamentals, fetch_analyst, fetch_earnings):
+        params = inspect.signature(fn).parameters
+        assert list(params)[:2] == ["tickers", "ticker_factory"]
+        assert params["ticker_factory"].default is None
+        for name in ("sleep", "min_interval", "retry_waits", "breaker_after", "rate_state"):
+            assert params[name].kind is inspect.Parameter.KEYWORD_ONLY, name
+        assert params["rate_state"].default is None
