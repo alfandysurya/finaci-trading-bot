@@ -342,3 +342,29 @@ def test_retry_budget_is_shared_across_fetches():
     assert second.calls == [5]  # 65 + 5 = 70 fits; the next 15 s would not
     assert len(make.calls) == 2
     assert state.tripped is True
+
+
+def test_budget_exhaustion_prints_one_line(capsys):
+    from scanner.fetch import RateLimitState
+
+    state = RateLimitState(retry_budget=10)
+    tickers = ["A", "B", "C"]
+    make = Counting({t: Flaky([YFRateLimitError("x")] * 99) for t in tickers})
+    fetch_earnings(tickers, ticker_factory=make, sleep=SleepLog(), min_interval=0,
+                   rate_state=state)
+    fetch_analyst(["A"], ticker_factory=make, sleep=SleepLog(), min_interval=0,
+                  rate_state=state)
+    out = capsys.readouterr().out
+    assert out.count("[fetch] retry budget exhausted: no more rate-limit retries this run") == 1
+
+
+def test_earnings_compared_against_supplied_today():
+    cal = {"Earnings Date": [pd.Timestamp("2026-10-20").date(),
+                             pd.Timestamp("2026-11-05").date()]}
+    f = factory({"A": FakeTicker(calendar=cal)})
+    s = fetch_earnings(["A"], ticker_factory=f, today=pd.Timestamp("2026-10-10"))
+    assert s["A"] == pd.Timestamp("2026-10-20")
+    s = fetch_earnings(["A"], ticker_factory=f, today=pd.Timestamp("2026-10-30"))
+    assert s["A"] == pd.Timestamp("2026-11-05")
+    s = fetch_earnings(["A"], ticker_factory=f, today=pd.Timestamp("2026-12-01"))
+    assert pd.isna(s["A"])

@@ -41,6 +41,7 @@ UNDELIVERED_CAP = 20      # stored undelivered messages (oldest dropped)
 MIN_PRICE_COVERAGE = 0.5  # weekly aborts below this share of constituents with prices
 DATA_WARN_PCT = 30        # warn when more than this % of stage-2 rows lack a data group
 EARNINGS_ABORT_PCT = 70   # weekly aborts when more than this % of earnings dates are unknown
+EARNINGS_ABORT_MIN_SAMPLE = 10  # ... but only with at least this many stage-2 tickers
 FRESH_DAYS = 4            # daily: a held ticker's last bar must be within as_of - 4 days
 _MIN_SECRET_LEN = 4  # shorter values would mangle ordinary text when scrubbed
 
@@ -50,7 +51,7 @@ class Deps:
     fetch_prices: Callable[[list[str], str], dict[str, pd.DataFrame]]
     fetch_fundamentals: Callable[[list[str]], pd.DataFrame]
     fetch_analyst: Callable[[list[str]], pd.DataFrame]
-    fetch_earnings: Callable[[list[str]], pd.Series]
+    fetch_earnings: Callable[..., pd.Series]  # (tickers, today=as_of)
     fetch_sp500: Callable[[], pd.DataFrame]
     telegram: Any
     drive_upload: Callable[[Path, list[str]], None] | None = None
@@ -650,10 +651,12 @@ def _weekly(run: _Run, cfg: dict, as_of: pd.Timestamp, state_dir: Path,
             # archived fundamentals/analyst/earnings frames therefore cover these
             # stage-2 tickers, not the whole liquid universe. Earnings come first, so a
             # blind blackout aborts after one slow fetch, not three.
-            earnings = (run.deps.fetch_earnings(survivors) if survivors
+            earnings = (run.deps.fetch_earnings(survivors, today=as_of) if survivors
                         else pd.Series(dtype="datetime64[ns]"))
             unknown = _unknown_earnings(earnings, survivors)
-            if unknown * 100 > EARNINGS_ABORT_PCT * len(survivors):
+            # Too few stage-2 tickers to tell an outage from chance: warn only (below).
+            if (len(survivors) >= EARNINGS_ABORT_MIN_SAMPLE
+                    and unknown * 100 > EARNINGS_ABORT_PCT * len(survivors)):
                 # A blind earnings blackout must not send picks as normal: alert as a
                 # scan failure (no marker, no ledger rows), so a rerun later is allowed.
                 raise RuntimeError(f"earnings dates unknown for {unknown}/{len(survivors)} "

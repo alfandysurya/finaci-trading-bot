@@ -27,13 +27,12 @@ BREAKER_AFTER = 8            # consecutive rate-limited tickers before giving up
 
 RETRY_BUDGET = 480           # seconds of retry waits allowed per run, across all fetches
 
-# Worst-case wall time: with a shared RateLimitState, all retry waits (5/15/45 s) in one
-# run add up to at most RETRY_BUDGET = 480 s (8 min), whatever the refusal pattern
-# (steady or on-and-off). After that, and after any breaker trip, every ticker gets a
-# single attempt, so the rest costs only the 0.25 s pauses plus Yahoo's own response
-# time. A fully refused run therefore spends at most about 8 min in retry waits in
-# total, under the 15-minute bound and the 30-minute workflow timeout (the weekly
-# fetches earnings first and aborts right after it when most dates are unknown).
+# Worst-case wall time: with a shared RateLimitState, the retry WAITS (5/15/45 s) of one
+# run add up to at most RETRY_BUDGET = 480 s (about 8 min), whatever the refusal
+# pattern (steady or on-and-off). After that, and after any breaker trip, every ticker
+# gets a single attempt. The total run time additionally includes, for N stage-2
+# tickers and 3 fetches, about N x 3 x (0.25 s pause + Yahoo's response time); the
+# weekly fetches earnings first and aborts right after it when most dates are unknown.
 
 
 @dataclass
@@ -48,8 +47,11 @@ class RateLimitState:
 
     def allow_wait(self, seconds: float) -> bool:
         """Book a retry wait if it fits the budget; otherwise trip and refuse."""
-        if self.tripped or self.waited + seconds > self.retry_budget:
+        if self.tripped:
+            return False
+        if self.waited + seconds > self.retry_budget:
             self.tripped = True
+            print("[fetch] retry budget exhausted: no more rate-limit retries this run")
             return False
         self.waited += seconds
         return True
@@ -117,14 +119,17 @@ def _analyst_row(tk) -> dict:
             "rec_trend": trend}
 
 
-def _next_earnings(tk) -> pd.Timestamp:
+def _next_earnings(tk, today=None) -> pd.Timestamp:
     cal = tk.calendar
     dates = cal.get("Earnings Date") if isinstance(cal, dict) else None
     if dates is None:
         return pd.NaT
     if not isinstance(dates, (list, tuple, pd.Series, np.ndarray)):
         dates = [dates]
-    today = pd.Timestamp.now().normalize()
+    today = pd.Timestamp.now() if today is None else pd.Timestamp(today)
+    if today.tzinfo is not None:
+        today = today.tz_localize(None)
+    today = today.normalize()
     parsed = []
     for d in dates:
         ts = pd.to_datetime(d, errors="coerce")
@@ -219,8 +224,11 @@ def fetch_earnings(tickers: list[str],
                    min_interval: float = MIN_INTERVAL,
                    retry_waits: Sequence[float] = RETRY_WAITS,
                    breaker_after: int = BREAKER_AFTER,
-                   rate_state: RateLimitState | None = None) -> pd.Series:
-    rows = _collect(tickers, ticker_factory, _next_earnings, pd.NaT, "earnings",
+                   rate_state: RateLimitState | None = None,
+                   today: pd.Timestamp | None = None) -> pd.Series:
+    """Next earnings date on or after `today` (default: now) per ticker; NaT if unknown."""
+    rows = _collect(tickers, ticker_factory, lambda tk: _next_earnings(tk, today), pd.NaT,
+                    "earnings",
                     **_throttle(sleep, min_interval, retry_waits, breaker_after,
                                 rate_state))
     s = pd.Series({t: rows[t] for t in tickers}, dtype="datetime64[ns]")
