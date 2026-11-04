@@ -295,3 +295,50 @@ def test_fetch_signatures_stay_backward_compatible():
         for name in ("sleep", "min_interval", "retry_waits", "breaker_after", "rate_state"):
             assert params[name].kind is inspect.Parameter.KEYWORD_ONLY, name
         assert params["rate_state"].default is None
+
+
+# ----------------------------------------------------------------- retry-wait budget
+def test_default_retry_budget_is_480_seconds():
+    from scanner.fetch import RateLimitState
+
+    assert RateLimitState().retry_budget == 480
+
+
+def test_on_and_off_refusals_exhaust_the_budget_then_stop_retrying(capsys):
+    from scanner.fetch import RateLimitState
+
+    state = RateLimitState(retry_budget=100)
+    tickers, mapping = [], {}
+    for i in range(6):  # refused, ok, refused, ok, ...: never 8 in a row
+        tickers += [f"R{i}", f"OK{i}"]
+        mapping[f"R{i}"] = Flaky([YFRateLimitError("x")] * 99)
+        mapping[f"OK{i}"] = FakeTicker({"trailingPE": 1.0})
+    make = Counting(mapping)
+    sleep = SleepLog()
+    df = fetch_fundamentals(tickers, ticker_factory=make, sleep=sleep, min_interval=0.25,
+                            rate_state=state)
+
+    waits = [s for s in sleep.calls if s != 0.25]
+    assert sum(waits) <= 100
+    assert waits == [5, 15, 45, 5, 15]  # R1's 45 s wait would exceed the budget
+    assert state.tripped is True
+    assert all(make.calls.count(f"R{i}") == 1 for i in range(2, 6))  # no retries after
+    assert "skipping" not in capsys.readouterr().out  # consecutive breaker never tripped
+    assert (df.loc[[f"OK{i}" for i in range(6)], "pe"] == 1.0).all()
+
+
+def test_retry_budget_is_shared_across_fetches():
+    from scanner.fetch import RateLimitState
+
+    state = RateLimitState(retry_budget=70)
+    first = SleepLog()
+    fetch_earnings(["A"], ticker_factory=Counting({"A": Flaky([YFRateLimitError("x")] * 9)}),
+                   sleep=first, min_interval=0, rate_state=state)
+    assert first.calls == [5, 15, 45] and state.tripped is False
+    second = SleepLog()
+    make = Counting({"B": Flaky([YFRateLimitError("x")] * 9)})
+    fetch_fundamentals(["B"], ticker_factory=make, sleep=second, min_interval=0,
+                       rate_state=state)
+    assert second.calls == [5]  # 65 + 5 = 70 fits; the next 15 s would not
+    assert len(make.calls) == 2
+    assert state.tripped is True

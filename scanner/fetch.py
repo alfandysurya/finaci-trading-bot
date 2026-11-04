@@ -25,22 +25,34 @@ MIN_INTERVAL = 0.25          # seconds between tickers
 RETRY_WAITS = (5, 15, 45)    # seconds before each retry of a rate-limited ticker
 BREAKER_AFTER = 8            # consecutive rate-limited tickers before giving up the fetch
 
-# Worst-case wall time when Yahoo refuses everything:
-# - the first fetch to trip spends BREAKER_AFTER x (5 + 15 + 45) s = 8 x 65 s = 520 s,
-#   about 8.7 min, before its breaker trips;
-# - every later fetch sharing the same RateLimitState runs without retries, so it trips
-#   after 8 single attempts and 7 x 0.25 s pauses: a few seconds.
-# So a fully rate-limited weekly run spends about 9 min in these fetches (the weekly
-# fetches earnings first and aborts right after it), under the 15-minute budget and
-# the 30-minute workflow timeout.
+RETRY_BUDGET = 480           # seconds of retry waits allowed per run, across all fetches
+
+# Worst-case wall time: with a shared RateLimitState, all retry waits (5/15/45 s) in one
+# run add up to at most RETRY_BUDGET = 480 s (8 min), whatever the refusal pattern
+# (steady or on-and-off). After that, and after any breaker trip, every ticker gets a
+# single attempt, so the rest costs only the 0.25 s pauses plus Yahoo's own response
+# time. A fully refused run therefore spends at most about 8 min in retry waits in
+# total, under the 15-minute bound and the 30-minute workflow timeout (the weekly
+# fetches earnings first and aborts right after it when most dates are unknown).
 
 
 @dataclass
 class RateLimitState:
-    """Shared by the fetches of one run: once any breaker trips, later fetches make a
-    single attempt per ticker instead of waiting through the retries again."""
+    """Shared by the fetches of one run. Once any breaker trips, or the retry waits
+    would exceed `retry_budget` seconds in total, every later attempt is a single one
+    (no retry waits) for the rest of the run."""
 
     tripped: bool = False
+    retry_budget: float = RETRY_BUDGET
+    waited: float = 0.0  # seconds slept in retry waits so far (not the min interval)
+
+    def allow_wait(self, seconds: float) -> bool:
+        """Book a retry wait if it fits the budget; otherwise trip and refuse."""
+        if self.tripped or self.waited + seconds > self.retry_budget:
+            self.tripped = True
+            return False
+        self.waited += seconds
+        return True
 
 
 def _sleep(seconds: float) -> None:  # module-level so tests can replace it
@@ -134,8 +146,6 @@ def _collect(tickers, ticker_factory, row_fn, empty_row, label, *, sleep=None,
              rate_state=None):
     make = _default_factory(ticker_factory)
     sleep = _sleep if sleep is None else sleep
-    if rate_state is not None and rate_state.tripped:
-        retry_waits = ()  # no-retry mode: an earlier fetch in this run already tripped
     tickers = list(tickers)
     rows = {}
     limited = 0  # consecutive tickers that ended rate limited
@@ -156,7 +166,8 @@ def _collect(tickers, ticker_factory, row_fn, empty_row, label, *, sleep=None,
                 break
             except Exception as exc:  # one bad ticker must not abort the batch
                 rate_limited = _is_rate_limit(exc)
-                if rate_limited and attempt < len(retry_waits):
+                if (rate_limited and attempt < len(retry_waits)
+                        and (rate_state is None or rate_state.allow_wait(retry_waits[attempt]))):
                     sleep(retry_waits[attempt])
                     continue
                 print(f"[fetch] {label} failed for {t}: {type(exc).__name__}: {exc}")
