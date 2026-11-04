@@ -38,7 +38,8 @@ LOOKBACK_DAYS = 400
 TOP_N = 3
 UNDELIVERED_CAP = 20      # stored undelivered messages (oldest dropped)
 MIN_PRICE_COVERAGE = 0.5  # weekly aborts below this share of constituents with prices
-DATA_WARN_PCT = 30        # warn when more than this % of eligible rows lack a data group
+DATA_WARN_PCT = 30        # warn when more than this % of stage-2 rows lack a data group
+EARNINGS_ABORT_PCT = 70   # weekly aborts when more than this % of earnings dates are unknown
 FRESH_DAYS = 4            # daily: a held ticker's last bar must be within as_of - 4 days
 _MIN_SECRET_LEN = 4  # shorter values would mangle ordinary text when scrubbed
 
@@ -508,17 +509,55 @@ def _send_main(run: _Run, state: dict, paths: dict[str, Path], res: dict, text: 
     _store_undelivered(run, state, paths, list(state.get("undelivered") or []) + [text])
 
 
-def _data_warning(fund: pd.DataFrame, analyst: pd.DataFrame, eligible: list[str]) -> str | None:
-    m = len(eligible)
+def _gics_fundamentals(fund: pd.DataFrame, tickers: list[str], gics: dict) -> pd.DataFrame:
+    """Fundamentals for `tickers` with the GICS sector from the constituent list: one
+    sector source for every ticker, so the per-sector cap never counts one sector under
+    two different labels (and stage 1 has a sector before Yahoo is asked)."""
+    out = fund.reindex(tickers, columns=FUNDAMENTAL_COLS).copy()
+    out["sector"] = [gics.get(t) for t in out.index]
+    return out
+
+
+def _price_survivors(prices: dict, eligible: list[str], gics: dict, held: list[str],
+                     as_of: pd.Timestamp, gates: dict, rejects: dict) -> list[str]:
+    """Weekly stage 1: gates on a price-only metric table (fundamentals, analyst and
+    earnings all empty, so the earnings blackout cannot fire yet), minus held tickers.
+    Gate rejects are recorded in `rejects`; survivors keep the `eligible` order."""
+    if not eligible:
+        return []
+    fund = _gics_fundamentals(pd.DataFrame(columns=FUNDAMENTAL_COLS), eligible, gics)
+    table = build_metric_table({t: prices[t] for t in eligible}, fund,
+                               pd.DataFrame(columns=ANALYST_COLS),
+                               pd.Series(dtype="datetime64[ns]"), as_of)
+    candidates, gate_rejects = apply_gates(table, as_of, gates["stale_days"],
+                                           gates["earnings_blackout_days"])
+    rejects.update(gate_rejects)
+    # Never re-pick a ticker that is already open or pending.
+    return [t for t in candidates.index if t not in set(held)]
+
+
+def _unknown_earnings(earnings: pd.Series, tickers: list[str]) -> int:
+    return int(pd.to_datetime(earnings.reindex(tickers), errors="coerce").isna().sum())
+
+
+def _data_warning(fund: pd.DataFrame, analyst: pd.DataFrame, earnings: pd.Series,
+                  tickers: list[str]) -> str | None:
+    """Coverage over the stage-2 tickers (the only ones fetched from Yahoo)."""
+    m = len(tickers)
     if not m:
         return None
     num_fund = [c for c in FUNDAMENTAL_COLS if c != "sector"]
-    n = int(fund.reindex(eligible, columns=num_fund).isna().all(axis=1).sum())
-    k = int(analyst.reindex(eligible, columns=ANALYST_COLS).isna().all(axis=1).sum())
+    n = int(fund.reindex(tickers, columns=num_fund).isna().all(axis=1).sum())
+    k = int(analyst.reindex(tickers, columns=ANALYST_COLS).isna().all(axis=1).sum())
+    e = _unknown_earnings(earnings, tickers)
+    parts = []
     if n * 100 > DATA_WARN_PCT * m or k * 100 > DATA_WARN_PCT * m:
-        return (f"DATA WARNING: fundamentals missing for {n}/{m}, analyst data missing for "
-                f"{k}/{m} - scores for those groups are unreliable")
-    return None
+        parts.append(f"fundamentals missing for {n}/{m}, analyst data missing for "
+                     f"{k}/{m} - scores for those groups are unreliable")
+    if e * 100 > DATA_WARN_PCT * m:
+        parts.append(f"earnings dates unknown for {e}/{m} - earnings blackout not "
+                     "applied to them")
+    return "DATA WARNING: " + "; ".join(parts) if parts else None
 
 
 def _with_warning(text: str, warning: str | None) -> str:
@@ -597,32 +636,41 @@ def _weekly(run: _Run, cfg: dict, as_of: pd.Timestamp, state_dir: Path,
         picks, sizing, stops, skipped, to_ledger = pd.DataFrame(), [], [], {}, []
         warning = None
         if not paused:
-            fund = (run.deps.fetch_fundamentals(eligible) if eligible
+            # Stage 1: price-only gates (stale, missing_data, trend, momentum) on the
+            # liquid universe, so the slow per-ticker Yahoo calls below are made only
+            # for the stocks that can still be picked.
+            survivors = _price_survivors(prices, eligible, gics, held, as_of, gates, rejects)
+            # Stage 2: fundamentals, analyst and earnings for the survivors only. The
+            # archived fundamentals/analyst/earnings frames therefore cover these
+            # stage-2 tickers, not the whole liquid universe.
+            fund = (run.deps.fetch_fundamentals(survivors) if survivors
                     else pd.DataFrame(columns=FUNDAMENTAL_COLS))
-            analyst = (run.deps.fetch_analyst(eligible) if eligible
+            analyst = (run.deps.fetch_analyst(survivors) if survivors
                        else pd.DataFrame(columns=ANALYST_COLS))
-            earnings = (run.deps.fetch_earnings(eligible) if eligible
+            earnings = (run.deps.fetch_earnings(survivors) if survivors
                         else pd.Series(dtype="datetime64[ns]"))
-            warning = _data_warning(fund, analyst, eligible)
+            unknown = _unknown_earnings(earnings, survivors)
+            if unknown * 100 > EARNINGS_ABORT_PCT * len(survivors):
+                # A blind earnings blackout must not send picks as normal: alert as a
+                # scan failure (no marker, no ledger rows), so a rerun later is allowed.
+                raise RuntimeError(f"earnings dates unknown for {unknown}/{len(survivors)} "
+                                   "stocks - earnings blackout cannot be checked")
+            warning = _data_warning(fund, analyst, earnings, survivors)
             if warning:
                 run.errors.append(warning)
-            # One sector source for every ticker (GICS from the constituent list), so
-            # the per-sector cap never counts one sector under two different labels.
-            fund = fund.reindex(eligible).copy()
-            fund["sector"] = [gics.get(t) for t in fund.index]
+            fund = _gics_fundamentals(fund, survivors, gics)
             frames["fundamentals"] = fund.rename_axis("ticker")
-            frames["analyst"] = analyst.reindex(eligible).rename_axis("ticker")
-            frames["earnings"] = (earnings.reindex(eligible).rename("next_earnings")
+            frames["analyst"] = analyst.reindex(survivors).rename_axis("ticker")
+            frames["earnings"] = (earnings.reindex(survivors).rename("next_earnings")
                                   .rename_axis("ticker").to_frame())
             scored = None
-            if eligible:
-                table = build_metric_table({t: prices[t] for t in eligible}, fund, analyst,
+            if survivors:
+                table = build_metric_table({t: prices[t] for t in survivors}, fund, analyst,
                                            earnings, as_of)
+                # Same gates again: now the earnings blackout can apply.
                 candidates, gate_rejects = apply_gates(
                     table, as_of, gates["stale_days"], gates["earnings_blackout_days"])
                 rejects.update(gate_rejects)
-                # Never re-pick a ticker that is already open or pending.
-                candidates = candidates.drop(index=[t for t in held if t in candidates.index])
                 if len(candidates):
                     scored = score_table(candidates, active)
             if scored is not None:

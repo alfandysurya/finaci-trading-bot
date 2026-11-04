@@ -52,7 +52,9 @@ def _analyst(tickers):
 
 
 def _earnings(tickers):
-    return pd.Series(pd.NaT, index=list(tickers), dtype="datetime64[ns]")
+    # Known and well outside the blackout: an all-unknown default would now abort the scan.
+    return pd.Series(AS_OF + pd.Timedelta(days=30), index=list(tickers),
+                     dtype="datetime64[ns]")
 
 
 def _sp500():
@@ -76,7 +78,7 @@ _DEFAULT = object()
 
 def make_deps(telegram=None, prices=None, future_bar=False, drive=_DEFAULT, sheets=None,
               price_calls=None, secrets=(), dry_run=False, sp500=None, fundamentals=None,
-              analyst=None, fetch_error=None):
+              analyst=None, fetch_error=None, earnings=None):
     from scanner.pipeline import Deps
 
     data = prices if prices is not None else synthetic_prices(
@@ -104,7 +106,7 @@ def make_deps(telegram=None, prices=None, future_bar=False, drive=_DEFAULT, shee
         fetch_prices=fetch_prices,
         fetch_fundamentals=fundamentals or _fundamentals,
         fetch_analyst=analyst or _analyst,
-        fetch_earnings=_earnings,
+        fetch_earnings=earnings or _earnings,
         fetch_sp500=sp500 or _sp500,
         telegram=telegram if telegram is not None else FakeTelegram(),
         drive_upload=Recorder() if drive is _DEFAULT else drive,
@@ -1025,16 +1027,18 @@ def test_weekly_data_warning_threshold(cfg, state_dir, which, extra, warn):
     tg = FakeTelegram()
     res = run_weekly(cfg, make_deps(tg, prices=data, sp500=sp500, **kw), AS_OF, state_dir)
 
-    assert seen == [100, 100]  # all 100 eligible: 30 blanks == 30%, 31 == 31%
+    # Only the 60 stage-1 survivors are fetched: 18 blanks == 30%, 19 > 30%.
+    assert seen == [60, 60]
     msg = weekly_messages(tg)[0]
     assert ("DATA WARNING" in msg) is warn
     assert any("DATA WARNING" in e for e in res["errors"]) is warn
     if warn:
-        n = 31 if which == "fundamentals" else 0
-        k = 31 if which == "analyst" else 0
-        line = (f"DATA WARNING: fundamentals missing for {n}/100, analyst data missing for "
-                f"{k}/100 - scores for those groups are unreliable")
+        n = 19 if which == "fundamentals" else 0
+        k = 19 if which == "analyst" else 0
+        line = (f"DATA WARNING: fundamentals missing for {n}/60, analyst data missing for "
+                f"{k}/60 - scores for those groups are unreliable")
         assert line in msg
+        assert "earnings dates unknown" not in msg
 
 
 # F-5 ------------------------------------------------------------------
@@ -1102,3 +1106,160 @@ def test_weekly_stale_frames_do_not_count_as_coverage(cfg, state_dir):
     res = run_weekly(cfg, make_deps(tg, prices=data), AS_OF, state_dir)
     assert any("price data covers 0 of 12 constituents" in e for e in res["errors"])
     assert weekly_messages(tg) == []
+
+
+# ----------------------------------------------------------------- two-stage fetch
+def _recording(base, log, name):
+    def fetch(tickers):
+        log.append((name, list(tickers)))
+        return base(tickers)
+    return fetch
+
+
+def test_weekly_stage2_fetches_only_stage1_survivors(cfg, tmp_path):
+    from scanner.pipeline import run_weekly
+
+    data = _synthetic()
+    state = tmp_path / "s"
+    _write_rows(state, [_open_row(data["T00"], "T00", "2026-09-01")])
+    log = []
+    deps = make_deps(FakeTelegram(),
+                     fundamentals=_recording(_fundamentals, log, "fundamentals"),
+                     analyst=_recording(_analyst, log, "analyst"),
+                     earnings=_recording(_earnings, log, "earnings"))
+    res = run_weekly(cfg, deps, AS_OF, state)
+
+    # Stage 1 keeps T00/T02/T05/T07/T11 (trend + momentum); T00 is held, so it is dropped.
+    survivors = ["T02", "T05", "T07", "T11"]
+    assert log == [("fundamentals", survivors), ("analyst", survivors),
+                   ("earnings", survivors)]
+    assert len(res["picks"]) >= 1
+    day = tmp_path / "archive" / "2026" / "10" / "30"
+    rejects = pd.read_parquet(day / "rejects.parquet").set_index("ticker")["reason"]
+    assert rejects["T00"] == "already held"
+    assert rejects["T01"] == "trend" and rejects["T10"] == "momentum"
+    # Archived fundamentals/analyst/earnings cover the stage-2 tickers only.
+    for name in ["fundamentals", "analyst", "earnings"]:
+        frame = pd.read_parquet(day / f"{name}.parquet")
+        tickers = frame["ticker"] if "ticker" in frame.columns else frame.index
+        assert sorted(tickers) == survivors, name
+
+
+def test_weekly_earnings_blackout_rejects_stage2_ticker(cfg, state_dir, tmp_path):
+    from scanner.pipeline import run_weekly
+
+    def earnings(tickers):
+        s = _earnings(tickers)
+        s["T05"] = pd.Timestamp("2026-11-02")  # 3 days after AS_OF: inside the blackout
+        return s
+
+    res = run_weekly(cfg, make_deps(FakeTelegram(), earnings=earnings), AS_OF, state_dir)
+    assert "T05" not in res["picks"].index
+    rejects = pd.read_parquet(tmp_path / "archive" / "2026" / "10" / "30" / "rejects.parquet")
+    assert rejects.set_index("ticker").loc["T05", "reason"] == "earnings_blackout"
+    assert res["errors"] == []
+
+
+def _unknown_earnings(n_unknown):
+    def fetch(tickers):
+        s = _earnings(tickers)
+        s.iloc[:n_unknown] = pd.NaT
+        return s
+    return fetch
+
+
+def test_weekly_warns_when_over_30pct_earnings_unknown(cfg, state_dir):
+    from scanner.pipeline import run_weekly
+
+    data, sp500 = _big_universe(100, 100)  # 60 stage-2 tickers
+    tg = FakeTelegram()
+    res = run_weekly(cfg, make_deps(tg, prices=data, sp500=sp500,
+                                    earnings=_unknown_earnings(19)), AS_OF, state_dir)
+    msg = weekly_messages(tg)[0]
+    line = ("DATA WARNING: earnings dates unknown for 19/60 - earnings blackout not "
+            "applied to them")
+    assert line in msg
+    assert any("earnings dates unknown for 19/60" in e for e in res["errors"])
+    assert _state(state_dir)["last_weekly_pick_date"] == "2026-10-30"
+
+
+def test_weekly_no_earnings_warning_at_exactly_30pct(cfg, state_dir):
+    from scanner.pipeline import run_weekly
+
+    data, sp500 = _big_universe(100, 100)
+    tg = FakeTelegram()
+    res = run_weekly(cfg, make_deps(tg, prices=data, sp500=sp500,
+                                    earnings=_unknown_earnings(18)), AS_OF, state_dir)
+    assert "DATA WARNING" not in weekly_messages(tg)[0]
+    assert res["errors"] == []
+
+
+def test_earnings_warning_joins_the_fundamentals_warning(cfg, state_dir):
+    from scanner.pipeline import run_weekly
+
+    data, sp500 = _big_universe(100, 100)
+    tg = FakeTelegram()
+    run_weekly(cfg, make_deps(tg, prices=data, sp500=sp500,
+                              fundamentals=_blanking(_fundamentals, NUM_FUND, 1, []),
+                              earnings=_unknown_earnings(20)), AS_OF, state_dir)
+    msg = weekly_messages(tg)[0]
+    assert ("DATA WARNING: fundamentals missing for 19/60, analyst data missing for 0/60 - "
+            "scores for those groups are unreliable; earnings dates unknown for 20/60 - "
+            "earnings blackout not applied to them") in msg
+
+
+def test_weekly_aborts_when_most_earnings_unknown_and_rerun_allowed(cfg, state_dir):
+    from scanner.pipeline import run_weekly
+
+    data, sp500 = _big_universe(100, 100)
+    tg = FakeTelegram()
+    res = run_weekly(cfg, make_deps(tg, prices=data, sp500=sp500,
+                                    earnings=_unknown_earnings(43)), AS_OF, state_dir)
+    # 43/60 unknown is more than 70%: a blind blackout must not send picks.
+    assert any(m.startswith("ALERT: scan failed") and "earnings dates unknown for 43/60" in m
+               for m in tg.sent)
+    assert weekly_messages(tg) == []
+    assert res["picks"].empty
+    assert read_ledger(state_dir / "ledger.csv").empty
+    assert _state(state_dir).get("last_weekly_pick_date") is None \
+        if (state_dir / "state.json").exists() else True
+    assert str(read_manifest(state_dir)["archive_ok"].iloc[-1]) == "False"
+
+    # Exactly 70% unknown (30% coverage) does not abort; a same-day rerun is allowed.
+    again = run_weekly(cfg, make_deps(tg, prices=data, sp500=sp500,
+                                      earnings=_unknown_earnings(42)), AS_OF, state_dir)
+    assert again["skipped_reason"] is None
+    assert len(weekly_messages(tg)) == 1
+    assert "earnings dates unknown for 42/60" in weekly_messages(tg)[0]
+    assert len(read_ledger(state_dir / "ledger.csv")) == len(again["picks"]) > 0
+    assert _state(state_dir)["last_weekly_pick_date"] == "2026-10-30"
+
+
+def test_weekly_no_survivors_is_no_picks_not_abort(cfg, state_dir):
+    from scanner.pipeline import run_weekly
+
+    calls = []
+    # Flat, liquid prices: every stock fails the trend gate (close is not above sma200).
+    data = {t: _bars(AS_OF, 300) for t in TICKERS}
+    tg = FakeTelegram()
+    res = run_weekly(cfg, make_deps(tg, prices=data,
+                                    earnings=_recording(_unknown_earnings(99), calls, "e")),
+                     AS_OF, state_dir)
+    assert calls == []
+    assert res["errors"] == []
+    assert tg.sent[-1].startswith("No picks this week")
+    assert _state(state_dir)["last_weekly_pick_date"] == "2026-10-30"
+
+
+def test_cli_prints_elapsed_time(tmp_path, monkeypatch, capsys):
+    import re
+
+    from scanner import cli
+
+    monkeypatch.setattr(cli, "ROOT", tmp_path)
+    deps = make_deps(FakeTelegram())
+    monkeypatch.setattr(cli, "default_deps", lambda env, dry_run: deps)
+    state = tmp_path / "st"
+    for cmd, day in [("weekly", "2026-10-30"), ("daily", "2026-10-09")]:
+        assert cli.main([cmd, "--as-of", day, "--state-dir", str(state)], env={}) == 0
+        assert re.search(r"^elapsed \d+s$", capsys.readouterr().out, re.M), cmd

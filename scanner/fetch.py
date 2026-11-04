@@ -1,7 +1,14 @@
-"""Thin yfinance adapters returning plain DataFrames/Series with fixed schemas."""
+"""Thin yfinance adapters returning plain DataFrames/Series with fixed schemas.
+
+The per-ticker fetches (fundamentals, analyst, earnings) are throttled: a pause
+between tickers, retries with growing waits when Yahoo answers "Too Many Requests",
+and a circuit breaker that stops calling Yahoo for the rest of a fetch after
+BREAKER_AFTER consecutive tickers stayed rate limited (their rows are left empty).
+"""
 from __future__ import annotations
 
-from typing import Any, Callable
+import time
+from typing import Any, Callable, Sequence
 
 import numpy as np
 import pandas as pd
@@ -12,6 +19,14 @@ FUNDAMENTAL_COLS = ["pe", "ev_ebitda", "fcf_yield", "sector"]
 ANALYST_COLS = ["rec_mean", "target_gap", "rec_trend"]
 _BUY_COLS = ["strongBuy", "buy"]
 _ALL_COLS = ["strongBuy", "buy", "hold", "sell", "strongSell"]
+
+MIN_INTERVAL = 0.25          # seconds between tickers
+RETRY_WAITS = (5, 15, 45)    # seconds before each retry of a rate-limited ticker
+BREAKER_AFTER = 8            # consecutive rate-limited tickers before giving up the fetch
+
+
+def _sleep(seconds: float) -> None:  # module-level so tests can replace it
+    time.sleep(seconds)
 
 
 def fetch_prices(tickers: list[str], start: str) -> dict[str, pd.DataFrame]:
@@ -92,37 +107,82 @@ def _next_earnings(tk) -> pd.Timestamp:
     return min(future) if future else pd.NaT
 
 
-def _collect(tickers, ticker_factory, row_fn, empty_row, label):
+def _is_rate_limit(exc: BaseException) -> bool:
+    return "RateLimit" in type(exc).__name__ or "Too Many Requests" in str(exc)
+
+
+def _collect(tickers, ticker_factory, row_fn, empty_row, label, *, sleep=None,
+             min_interval=MIN_INTERVAL, retry_waits=RETRY_WAITS, breaker_after=BREAKER_AFTER):
     make = _default_factory(ticker_factory)
+    sleep = _sleep if sleep is None else sleep
+    tickers = list(tickers)
     rows = {}
-    for t in tickers:
-        try:
-            rows[t] = row_fn(make(t))
-        except Exception as exc:  # one bad ticker must not abort the batch
-            print(f"[fetch] {label} failed for {t}: {type(exc).__name__}: {exc}")
-            rows[t] = empty_row
+    limited = 0  # consecutive tickers that ended rate limited
+    for i, t in enumerate(tickers):
+        if limited >= breaker_after:
+            rest = tickers[i:]
+            print(f"[fetch] rate limited: skipping {len(rest)} remaining {label}")
+            for r in rest:
+                rows[r] = empty_row
+            break
+        if i and min_interval > 0:
+            sleep(min_interval)
+        rows[t] = empty_row
+        for attempt in range(len(retry_waits) + 1):
+            try:
+                rows[t] = row_fn(make(t))
+                limited = 0
+                break
+            except Exception as exc:  # one bad ticker must not abort the batch
+                rate_limited = _is_rate_limit(exc)
+                if rate_limited and attempt < len(retry_waits):
+                    sleep(retry_waits[attempt])
+                    continue
+                print(f"[fetch] {label} failed for {t}: {type(exc).__name__}: {exc}")
+                limited = limited + 1 if rate_limited else 0
+                break
     return rows
 
 
+def _throttle(sleep, min_interval, retry_waits, breaker_after) -> dict:
+    return {"sleep": sleep, "min_interval": min_interval, "retry_waits": tuple(retry_waits),
+            "breaker_after": breaker_after}
+
+
 def fetch_fundamentals(tickers: list[str],
-                       ticker_factory: Callable[[str], Any] | None = None) -> pd.DataFrame:
+                       ticker_factory: Callable[[str], Any] | None = None,
+                       *, sleep: Callable[[float], None] | None = None,
+                       min_interval: float = MIN_INTERVAL,
+                       retry_waits: Sequence[float] = RETRY_WAITS,
+                       breaker_after: int = BREAKER_AFTER) -> pd.DataFrame:
     empty = {"pe": np.nan, "ev_ebitda": np.nan, "fcf_yield": np.nan, "sector": None}
     rows = _collect(tickers, ticker_factory, lambda tk: _fundamentals_row(tk.info or {}),
-                    empty, "fundamentals")
+                    empty, "fundamentals", **_throttle(sleep, min_interval, retry_waits,
+                                                       breaker_after))
     df = pd.DataFrame.from_dict(rows, orient="index", columns=FUNDAMENTAL_COLS)
     return df.reindex(list(tickers))
 
 
 def fetch_analyst(tickers: list[str],
-                  ticker_factory: Callable[[str], Any] | None = None) -> pd.DataFrame:
+                  ticker_factory: Callable[[str], Any] | None = None,
+                  *, sleep: Callable[[float], None] | None = None,
+                  min_interval: float = MIN_INTERVAL,
+                  retry_waits: Sequence[float] = RETRY_WAITS,
+                  breaker_after: int = BREAKER_AFTER) -> pd.DataFrame:
     empty = {c: np.nan for c in ANALYST_COLS}
-    rows = _collect(tickers, ticker_factory, _analyst_row, empty, "analyst")
+    rows = _collect(tickers, ticker_factory, _analyst_row, empty, "analyst",
+                    **_throttle(sleep, min_interval, retry_waits, breaker_after))
     df = pd.DataFrame.from_dict(rows, orient="index", columns=ANALYST_COLS).astype(float)
     return df.reindex(list(tickers))
 
 
 def fetch_earnings(tickers: list[str],
-                   ticker_factory: Callable[[str], Any] | None = None) -> pd.Series:
-    rows = _collect(tickers, ticker_factory, _next_earnings, pd.NaT, "earnings")
+                   ticker_factory: Callable[[str], Any] | None = None,
+                   *, sleep: Callable[[float], None] | None = None,
+                   min_interval: float = MIN_INTERVAL,
+                   retry_waits: Sequence[float] = RETRY_WAITS,
+                   breaker_after: int = BREAKER_AFTER) -> pd.Series:
+    rows = _collect(tickers, ticker_factory, _next_earnings, pd.NaT, "earnings",
+                    **_throttle(sleep, min_interval, retry_waits, breaker_after))
     s = pd.Series({t: rows[t] for t in tickers}, dtype="datetime64[ns]")
     return s.reindex(list(tickers))

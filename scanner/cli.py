@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Mapping
@@ -83,6 +84,7 @@ def main(argv=None, env: Mapping[str, str] | None = None) -> int:
         print(f"Drive write OK: test file {file_id} created and deleted")
         return 0
 
+    started = time.monotonic()
     cfg = load_scanner_config()
     state_dir, archive_root = resolve_paths(args, cfg)
     deps = default_deps(env, dry_run=args.dry_run)
@@ -99,6 +101,8 @@ def main(argv=None, env: Mapping[str, str] | None = None) -> int:
     print(f"messages sent: {len(result['sent'])}; archive ok: {result['archive_ok']}")
     for err in result["errors"]:
         print(f"error: {err}")
+    # Compare with the workflow's 30-minute timeout.
+    print(f"elapsed {round(time.monotonic() - started)}s")
     if result.get("send_failed"):
         # All state is already saved (the message is queued in state.json for the next
         # run); the workflow's commit step runs with if: always().

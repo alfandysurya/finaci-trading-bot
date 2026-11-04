@@ -113,4 +113,9 @@ Keep the other files: `settings.json` (your profile and indicator choices), `tel
 - `config_version` covers only the profile, the indicator toggles and the weights. Editing `sizing:` or `gates:` in `scanner.yaml` does not start a new version, so results before and after such an edit are counted together.
 - The stop and quantity are worked out from the pick-day close, but the paper entry fills at the next open, so the real distance to the stop can differ a little.
 - Prices are adjusted for dividends, so a stop can shift slightly relative to past prices.
+- Yahoo Finance may refuse requests when too many arrive at once ("Too Many Requests"). The scanner waits a little between stocks and retries a refused request a few times. If Yahoo keeps refusing, it stops asking for the rest of that batch.
+- The weekly run fetches fundamentals, analyst data and earnings dates only for stocks that already passed the price checks (trend, momentum, fresh data, not already held). The archived `fundamentals`, `analyst` and `earnings` files cover those stocks only.
+- If earnings dates cannot be fetched for most of those stocks (more than 70%), the weekly run stops with an error alert and sends no picks, because the earnings check would be blind. You can run it again later the same day. If more than 30% are missing, the picks are still sent with a DATA WARNING line.
+- A pick marked "earnings date unknown" was not checked against its earnings date. Check it yourself before acting.
+- Each run prints `elapsed <N>s` at the end. The workflows stop after 30 minutes, so compare against that if Yahoo is slow.
 - The archived `scores` file holds the scored candidates only. Stocks that failed a check (liquidity, trend, earnings, already held) are listed with their reason in `rejects`.
