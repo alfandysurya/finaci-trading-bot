@@ -1,0 +1,58 @@
+name: scanner-daily
+
+on:
+  schedule:
+    - cron: "30 21 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: scanner-state
+  cancel-in-progress: false
+
+jobs:
+  daily:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Refuse to run while the US market is open
+        id: market-guard
+        run: |
+          set -- $(TZ=America/New_York date '+%u %H%M')
+          dow=$1
+          hm=$((10#$2))
+          if [ "$dow" -le 5 ] && [ "$hm" -ge 930 ] && [ "$hm" -le 1615 ]; then
+            printf '%s\n' "Refusing to run: US market is open; run after 16:00 America/New_York" >&2
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Run scanner daily
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+        run: uv run python -m scanner daily
+
+      - name: Commit scanner state
+        if: always()
+        run: |
+          mkdir -p scanner_state
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add scanner_state
+          if ! git diff --cached --quiet; then
+            git commit -m "scanner: update state"
+            git pull --rebase
+            git push
+          fi

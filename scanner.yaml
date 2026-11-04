@@ -1,0 +1,46 @@
+universe:
+  source: sp500
+  min_dollar_volume: 50000000
+  min_price: 5
+  window: 20
+
+gates:
+  sma: 200
+  momentum_days: 63
+  earnings_blackout_days: 5
+  max_per_sector: 2
+  stale_days: 5
+  hold_days_max: 56
+
+sizing:
+  stop_atr_mult: 2.0
+  risk_pct: 0.01
+  cap_pct: 0.20
+  min_order: 30
+  open_risk_limit_pct: 0.05
+  pause_drawdown_pct: 0.20
+
+# Blend weights are technical / fundamental / sentiment / risk.
+profiles:
+  balanced:
+    name: Balanced
+    weights: {technical: 0.30, fundamental: 0.30, sentiment: 0.20, risk: 0.20}
+    toggles: [sma_trend, rsi, macd, volume, valuation_pe, ev_ebitda, fcf_yield, analyst]
+  value:
+    name: Value
+    weights: {technical: 0.20, fundamental: 0.50, sentiment: 0.15, risk: 0.15}
+    toggles: [valuation_pe, ev_ebitda, fcf_yield, analyst, sma_trend, rsi]
+  momentum:
+    name: Momentum
+    weights: {technical: 0.50, fundamental: 0.15, sentiment: 0.15, risk: 0.20}
+    toggles: [sma_trend, rsi, macd, volume, analyst, fcf_yield]
+
+toggles: [sma_trend, rsi, macd, volume, valuation_pe, ev_ebitda, fcf_yield, analyst]
+
+paper_account:
+  start_equity: 1000  # set to your real account size
+
+archive:
+  drive_folder_env: DRIVE_FOLDER_ID
+  state_dir: scanner_state
+  archive_dir: data/archive

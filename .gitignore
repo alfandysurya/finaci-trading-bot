@@ -1,4 +1,7 @@
 data/cache/
+data/archive/
+.dryrun/
+scanner_state/*.tmp
 holdings.yaml
 .env
 .venv/
