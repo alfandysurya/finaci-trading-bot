@@ -1,6 +1,7 @@
 from scanner.config import active_settings, config_version, load_scanner_config
 
-TOGGLES = ["sma_trend", "rsi", "macd", "volume", "valuation_pe", "ev_ebitda", "fcf_yield", "analyst"]
+TOGGLES = ["sma_trend", "rsi", "macd", "volume", "valuation_pe", "ev_ebitda", "fcf_yield", "peg",
+           "eps_growth", "forward_pe", "roe", "debt_equity", "analyst"]
 W = {"technical": 0.3, "fundamental": 0.3, "sentiment": 0.2, "risk": 0.2}
 
 
@@ -18,10 +19,11 @@ def test_label_custom_when_toggles_differ_from_profile_preset():
     cfg = load_scanner_config()
     preset = active_settings(cfg, {"profile": "balanced"})
     assert preset["label"] == "Balanced"
-    shuffled = active_settings(cfg, {"profile": "balanced", "toggles": list(reversed(TOGGLES))})
+    preset_toggles = cfg["profiles"]["balanced"]["toggles"]
+    shuffled = active_settings(cfg, {"profile": "balanced", "toggles": list(reversed(preset_toggles))})
     assert shuffled["label"] == "Balanced"
     assert shuffled["version"] == preset["version"]
-    custom = active_settings(cfg, {"profile": "balanced", "toggles": TOGGLES[:-1]})
+    custom = active_settings(cfg, {"profile": "balanced", "toggles": preset_toggles[:-1]})
     assert custom["label"] == "Custom (based on Balanced)"
     assert custom["version"] != preset["version"]
     assert custom["weights"] == cfg["profiles"]["balanced"]["weights"]

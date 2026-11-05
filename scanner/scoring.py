@@ -10,11 +10,16 @@ REQUIRED = ["close", "sma200", "ret_63d", "atr14", "sector"]
 
 GROUPS = {
     "technical": ["sma_trend", "rsi", "macd", "volume"],
-    "fundamental": ["valuation_pe", "ev_ebitda", "fcf_yield"],
+    "fundamental": ["valuation_pe", "ev_ebitda", "fcf_yield", "peg", "eps_growth",
+                    "forward_pe", "roe", "debt_equity"],
     "sentiment": ["analyst"],
 }
 
-_FUND_COLS = ["pe", "ev_ebitda", "fcf_yield", "sector"]
+_FUND_COLS = ["pe", "ev_ebitda", "fcf_yield", "peg", "eps_growth", "forward_pe",
+              "roe", "debt_equity", "sector"]
+
+# Debt-to-equity is not meaningful for these (guide: "except banks/utilities").
+_DER_EXEMPT = {"Financials", "Financial Services", "Utilities"}
 _ANALYST_COLS = ["rec_mean", "target_gap", "rec_trend"]
 
 
@@ -130,6 +135,21 @@ def _toggle_rank(table: pd.DataFrame, toggle: str) -> pd.Series:
         return percentile_rank(-ev.where(ev > 0))
     if toggle == "fcf_yield":
         return percentile_rank(_num(table, "fcf_yield"))
+    if toggle == "peg":
+        peg = _num(table, "peg")
+        return percentile_rank(-peg.where(peg > 0))
+    if toggle == "eps_growth":
+        return percentile_rank(_num(table, "eps_growth"))
+    if toggle == "forward_pe":
+        fpe = _num(table, "forward_pe")
+        return percentile_rank(-fpe.where(fpe > 0))
+    if toggle == "roe":
+        return percentile_rank(_num(table, "roe"))
+    if toggle == "debt_equity":
+        de = _num(table, "debt_equity")
+        rank = percentile_rank(-de.where(de >= 0))
+        exempt = table["sector"].isin(_DER_EXEMPT) if "sector" in table else False
+        return rank.where(~exempt, 50.0)
     if toggle == "analyst":
         return _row_mean([
             percentile_rank(_num(table, "rec_mean"), higher_is_better=False),

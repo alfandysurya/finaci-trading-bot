@@ -16,7 +16,8 @@ import pandas as pd
 
 from trader.data import download_yfinance
 
-FUNDAMENTAL_COLS = ["pe", "ev_ebitda", "fcf_yield", "sector"]
+FUNDAMENTAL_COLS = ["pe", "ev_ebitda", "fcf_yield", "peg", "eps_growth", "forward_pe",
+                    "roe", "debt_equity", "sector"]
 ANALYST_COLS = ["rec_mean", "target_gap", "rec_trend"]
 _BUY_COLS = ["strongBuy", "buy"]
 _ALL_COLS = ["strongBuy", "buy", "hold", "sell", "strongSell"]
@@ -85,10 +86,19 @@ def _fundamentals_row(info: dict) -> dict:
     cap, fcf = _num(info.get("marketCap")), _num(info.get("freeCashflow"))
     fcf_yield = fcf / cap if np.isfinite(cap) and cap > 0 and np.isfinite(fcf) else np.nan
     sector = info.get("sector")
+    peg = info.get("trailingPegRatio")
+    de = _num(info.get("debtToEquity"))  # Yahoo reports percent (150 = 1.5x)
     return {
         "pe": _num(info.get("trailingPE")),
         "ev_ebitda": _num(info.get("enterpriseToEbitda")),
         "fcf_yield": fcf_yield,
+        "peg": _num(peg if peg is not None else info.get("pegRatio")),
+        # Yahoo's quarterly earnings growth is year-over-year, the closest field in
+        # the one info call (true QoQ needs a second request per ticker).
+        "eps_growth": _num(info.get("earningsQuarterlyGrowth")),
+        "forward_pe": _num(info.get("forwardPE")),
+        "roe": _num(info.get("returnOnEquity")),
+        "debt_equity": de / 100 if np.isfinite(de) else np.nan,
         "sector": sector if isinstance(sector, str) else None,
     }
 
@@ -195,7 +205,7 @@ def fetch_fundamentals(tickers: list[str],
                        retry_waits: Sequence[float] = RETRY_WAITS,
                        breaker_after: int = BREAKER_AFTER,
                        rate_state: RateLimitState | None = None) -> pd.DataFrame:
-    empty = {"pe": np.nan, "ev_ebitda": np.nan, "fcf_yield": np.nan, "sector": None}
+    empty = {**{c: np.nan for c in FUNDAMENTAL_COLS if c != "sector"}, "sector": None}
     rows = _collect(tickers, ticker_factory, lambda tk: _fundamentals_row(tk.info or {}),
                     empty, "fundamentals", **_throttle(sleep, min_interval, retry_waits,
                                                        breaker_after, rate_state))

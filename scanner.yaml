@@ -25,17 +25,18 @@ profiles:
   balanced:
     name: Balanced
     weights: {technical: 0.30, fundamental: 0.30, sentiment: 0.20, risk: 0.20}
-    toggles: [sma_trend, rsi, macd, volume, valuation_pe, ev_ebitda, fcf_yield, analyst]
+    toggles: [sma_trend, rsi, macd, volume, peg, eps_growth, forward_pe, roe, debt_equity, fcf_yield, analyst]
   value:
     name: Value
     weights: {technical: 0.20, fundamental: 0.50, sentiment: 0.15, risk: 0.15}
-    toggles: [valuation_pe, ev_ebitda, fcf_yield, analyst, sma_trend, rsi]
+    toggles: [peg, forward_pe, roe, debt_equity, fcf_yield, analyst, sma_trend, rsi]
   momentum:
     name: Momentum
     weights: {technical: 0.50, fundamental: 0.15, sentiment: 0.15, risk: 0.20}
-    toggles: [sma_trend, rsi, macd, volume, analyst, fcf_yield]
+    toggles: [sma_trend, rsi, macd, volume, analyst, eps_growth, fcf_yield]
 
-toggles: [sma_trend, rsi, macd, volume, valuation_pe, ev_ebitda, fcf_yield, analyst]
+toggles: [sma_trend, rsi, macd, volume, valuation_pe, ev_ebitda, fcf_yield, peg, eps_growth,
+          forward_pe, roe, debt_equity, analyst]
 
 paper_account:
   start_equity: 1000  # set to your real account size

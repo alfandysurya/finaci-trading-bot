@@ -3,7 +3,7 @@ import pandas as pd
 import pytest
 
 from scanner import fetch as fetch_mod
-from scanner.fetch import fetch_analyst, fetch_earnings, fetch_fundamentals
+from scanner.fetch import FUNDAMENTAL_COLS, fetch_analyst, fetch_earnings, fetch_fundamentals
 
 
 @pytest.fixture(autouse=True)
@@ -43,7 +43,7 @@ def test_fundamentals_missing_field_is_nan_not_error():
     f = factory({"AAA": FakeTicker({"trailingPE": 12.0, "marketCap": 100.0,
                                      "freeCashflow": 5.0, "sector": "Tech"})})
     df = fetch_fundamentals(["AAA"], ticker_factory=f)
-    assert list(df.columns) == ["pe", "ev_ebitda", "fcf_yield", "sector"]
+    assert list(df.columns) == FUNDAMENTAL_COLS
     assert df.loc["AAA", "pe"] == 12.0
     assert np.isnan(df.loc["AAA", "ev_ebitda"])
     assert df.loc["AAA", "fcf_yield"] == 0.05
@@ -368,3 +368,12 @@ def test_earnings_compared_against_supplied_today():
     assert s["A"] == pd.Timestamp("2026-11-05")
     s = fetch_earnings(["A"], ticker_factory=f, today=pd.Timestamp("2026-12-01"))
     assert pd.isna(s["A"])
+
+
+def test_fundamentals_guide_ratios_mapped_and_der_scaled():
+    f = factory({"AAA": FakeTicker({"trailingPegRatio": 0.8, "forwardPE": 14.0,
+                                     "returnOnEquity": 0.22, "debtToEquity": 150.0,
+                                     "earningsQuarterlyGrowth": 0.3})})
+    r = fetch_fundamentals(["AAA"], ticker_factory=f).loc["AAA"]
+    assert (r["peg"], r["forward_pe"], r["roe"], r["eps_growth"]) == (0.8, 14.0, 0.22, 0.3)
+    assert r["debt_equity"] == 1.5

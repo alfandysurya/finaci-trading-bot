@@ -153,7 +153,9 @@ def test_disabled_toggle_does_not_affect_score():
 
 
 def test_blend_uses_profile_weights():
-    scored = score_table(_three(), _settings())
+    legacy = ["sma_trend", "rsi", "macd", "volume", "valuation_pe", "ev_ebitda",
+              "fcf_yield", "analyst"]
+    scored = score_table(_three(), _settings(legacy))
     # Hand-computed ranks:
     # A: tech (100,100,50,100)=87.5; fund (100,100,0)=66.667;
     #    sent mean(100,50,100)=83.333; risk mean(100,100,50)=83.333
@@ -202,3 +204,19 @@ def test_select_top_ties_broken_by_ticker():
         "AAA": {"sector": "Energy", "blend": 50.0},
     })
     assert list(select_top(scored).index) == ["AAA", "ZZZ"]
+
+
+def test_guide_toggles_rank_direction_and_der_exemption():
+    import numpy as np
+    import pandas as pd
+    from scanner.scoring import _toggle_rank
+    t = pd.DataFrame({"peg": [0.5, 2.0, -1.0], "forward_pe": [10.0, 30.0, np.nan],
+                      "roe": [0.30, 0.05, 0.1], "eps_growth": [0.4, -0.2, 0.0],
+                      "debt_equity": [0.2, 3.0, 9.0],
+                      "sector": ["Tech", "Tech", "Financials"]},
+                     index=["A", "B", "C"])
+    for tog in ("peg", "forward_pe", "roe", "eps_growth", "debt_equity"):
+        r = _toggle_rank(t, tog)
+        assert r["A"] > r["B"], tog
+    assert np.isnan(_toggle_rank(t, "peg")["C"])      # negative PEG is not ranked
+    assert _toggle_rank(t, "debt_equity")["C"] == 50  # bank: DER ignored, neutral
